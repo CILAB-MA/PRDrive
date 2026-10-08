@@ -1195,8 +1195,12 @@ class WandbLogger:
         import wandb
 
         run_name = args.get("wandb_run_name", None)
+        # wandb 0.30 moved this off wandb.util
+        generate_id = getattr(wandb.util, "generate_id", None)
+        if generate_id is None:
+            from wandb.sdk.lib.runid import generate_id
         wandb.init(
-            id=load_id or wandb.util.generate_id(),
+            id=load_id or generate_id(),
             name=run_name,
             project=args["wandb_project"],
             group=args["wandb_group"],

@@ -237,7 +237,7 @@ class Drive(pufferlib.PufferEnv):
 
         self._action_type_flag = 0 if action_type == "discrete" else 1
 
-        # Check if resources directory exists
+        # Check if resources directory exists. Names match C `%03d`: map_000.bin, map_1000.bin.
         binary_path = f"{map_dir}/map_000.bin"
         if not os.path.exists(binary_path):
             raise FileNotFoundError(
@@ -1153,6 +1153,8 @@ def process_all_maps(
     data_folder="data/processed/training",
     max_maps=50_000,
     num_workers=None,
+    output_dir=None,
+    index_offset=0,
 ):
     """Process all maps and save them as binaries using multiprocessing
 
@@ -1160,45 +1162,70 @@ def process_all_maps(
         data_folder: Path to the folder containing JSON map files
         max_maps: Maximum number of maps to process
         num_workers: Number of parallel workers (defaults to cpu_count())
+        output_dir: Destination for ``map_XXX.bin`` files. Defaults to
+            ``resources/drive/binaries/{dataset_name}`` (basename of data_folder).
+        index_offset: Added to the per-folder index so several folders can share
+            one output directory. Names match the C loader's ``map_%03d.bin``
+            (minimum 3 digits: ``map_000.bin``, ``map_1000.bin``).
+
+    Returns:
+        Number of JSON files considered (for chaining ``index_offset``).
     """
     from pathlib import Path
 
     if num_workers is None:
         num_workers = cpu_count()
 
-    # Path to the training data
     data_dir = Path(data_folder)
     dataset_name = data_dir.name
 
-    # Create the binaries directory if it doesn't exist
-    binary_dir = Path(f"resources/drive/binaries/{dataset_name}")
+    if output_dir is None:
+        binary_dir = Path(f"resources/drive/binaries/{dataset_name}")
+    else:
+        binary_dir = Path(output_dir)
     binary_dir.mkdir(parents=True, exist_ok=True)
 
-    # Get all JSON files in the training directory
     json_files = sorted(data_dir.glob("*.json"))
+    if not json_files:
+        print(f"No JSON files in {data_dir}")
+        return 0
 
-    # Prepare arguments for parallel processing
+    n = min(len(json_files), max_maps)
+    print(
+        f"Processing {n}/{len(json_files)} maps from {data_dir} -> {binary_dir} "
+        f"(offset={index_offset}, {num_workers} workers)"
+    )
+
     tasks = []
+    skipped = 0
     for i, map_path in enumerate(json_files[:max_maps]):
-        binary_file = f"map_{i:03d}.bin"
+        binary_file = f"map_{i + int(index_offset):03d}.bin"
         binary_path = binary_dir / binary_file
+        # Resume: keep non-empty bins already written (kill-safe).
+        if binary_path.is_file() and binary_path.stat().st_size > 0:
+            skipped += 1
+            continue
         tasks.append((i, map_path, binary_path))
+    print(f"  skip existing={skipped}  remaining={len(tasks)}")
+    if not tasks:
+        print(f"Done {dataset_name}: nothing to do -> {binary_dir}")
+        return n
 
-    # Process maps in parallel with progress bar
     with Pool(num_workers) as pool:
         results = list(
-            tqdm(pool.imap(_process_single_map, tasks), total=len(tasks), desc="Processing maps", unit="map")
+            tqdm(pool.imap(_process_single_map, tasks), total=len(tasks), desc=f"{dataset_name}", unit="map")
         )
 
-    # Collect statistics
     successful = sum(1 for _, _, success, _ in results if success)
     failed = sum(1 for _, _, success, _ in results if not success)
+    print(f"Done {dataset_name}: {successful} ok, {failed} failed -> {binary_dir}")
 
     if failed > 0:
         print(f"\nFailed {failed}/{len(results)} files:")
         for i, name, success, error in results:
             if not success:
                 print(f"  {name}: {error}")
+    return n
 
 
 def test_performance(timeout=10, atn_cache=12, num_agents=12):
@@ -1244,7 +1271,50 @@ def test_performance(timeout=10, atn_cache=12, num_agents=12):
 
 
 if __name__ == "__main__":
-    # analyze_action_space(data_folder="data/processed/training_50k", max_maps=10000)
-    # test_performance()
-    # Process the train dataset
-    process_all_maps(data_folder="data/processed/training")
+    import argparse
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description="Convert WOMD/Carla JSON maps to Drive binaries")
+    parser.add_argument(
+        "--data-root",
+        type=str,
+        default=None,
+        help="Parent folder whose subdirs (e.g. training/validation) each contain *.json",
+    )
+    parser.add_argument(
+        "--data-folder",
+        type=str,
+        default=None,
+        help="Single folder of *.json (legacy). Ignored if --data-root is set.",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=str,
+        default="resources/drive/binaries",
+        help="Root for binaries; writes {output_root}/{subdir}/map_XXX.bin",
+    )
+    parser.add_argument("--max-maps", type=int, default=50_000)
+    parser.add_argument("--num-workers", type=int, default=None)
+    cli = parser.parse_args()
+
+    if cli.data_root:
+        root = Path(cli.data_root)
+        subdirs = sorted(p for p in root.iterdir() if p.is_dir())
+        if not subdirs:
+            raise SystemExit(f"No subdirectories under {root}")
+        for sub in subdirs:
+            process_all_maps(
+                data_folder=str(sub),
+                max_maps=cli.max_maps,
+                num_workers=cli.num_workers,
+                output_dir=str(Path(cli.output_root) / sub.name),
+            )
+    else:
+        folder = cli.data_folder or "data/processed/training"
+        name = Path(folder).name
+        process_all_maps(
+            data_folder=folder,
+            max_maps=cli.max_maps,
+            num_workers=cli.num_workers,
+            output_dir=str(Path(cli.output_root) / name),
+        )
