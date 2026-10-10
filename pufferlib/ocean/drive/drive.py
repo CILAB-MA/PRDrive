@@ -87,8 +87,10 @@ class Drive(pufferlib.PufferEnv):
         obs_partner_noise_speed=0.0,
         obs_partner_noise_pos=0.0,
         async_resets=True,
-        map_sampling_strategy="uniform",  # "uniform" (unchanged rand() in C) or "prioritized" (PLR LevelSampler)
+        map_sampling_strategy="uniform",  # "uniform", "prioritized", or "sequential"
         map_sampler_seed=None,
+        map_score="return",  # "return" or "max_mc" (only used when a LevelSampler is active)
+        map_agent_reduce="mean",  # "mean", "max", or "min": agent MaxMC scores -> one map score
     ):
         # env
         self.dt = dt
@@ -100,14 +102,30 @@ class Drive(pufferlib.PufferEnv):
         # default behavior); "prioritized" hands C a PLR-ordered candidate queue
         # instead (see binding.c: my_shared's map_id_queue).
         self.map_sampling_strategy = map_sampling_strategy
+        self.map_score = map_score
+        if map_score not in ("return", "max_mc"):
+            raise ValueError(f"map_score must be 'return' or 'max_mc'. Got: {map_score!r}")
+        self.map_agent_reduce = map_agent_reduce
         if map_sampling_strategy == "prioritized":
-            self.level_sampler = LevelSampler(num_maps=num_maps, seed=map_sampler_seed)
+            self.level_sampler = LevelSampler(
+                num_maps=num_maps, seed=map_sampler_seed, strategy="prioritized", agent_aggregate=map_agent_reduce
+            )
+        elif map_sampling_strategy == "sequential":
+            self.level_sampler = LevelSampler(
+                num_maps=num_maps, seed=map_sampler_seed, strategy="sequential", agent_aggregate=map_agent_reduce
+            )
         elif map_sampling_strategy == "uniform":
             self.level_sampler = None
         else:
             raise ValueError(
-                f"map_sampling_strategy must be 'uniform' or 'prioritized'. Got: {map_sampling_strategy!r}"
+                f"map_sampling_strategy must be 'uniform', 'prioritized', or 'sequential'. Got: {map_sampling_strategy!r}"
             )
+        self.controllable_counts = self._load_controllable_counts(map_dir, num_maps)
+        self._plr_value_buf = buf.get("values") if isinstance(buf, dict) and "values" in buf else None
+        self._pending_values = None
+        self._mc_rewards = []
+        self._mc_values = []
+        self._mc_dones = []
         self.reward_vehicle_collision = reward_vehicle_collision
         self.reward_offroad_collision = reward_offroad_collision
         self.reward_goal = reward_goal
@@ -252,6 +270,8 @@ class Drive(pufferlib.PufferEnv):
             )
 
         # Iterate through all maps to count total agents that can be initialized for each map
+        self._map_load_idx = 0
+        self.map_load_log = []
         map_id_queue, _ = self._build_map_id_queue(num_agents)
         agent_offsets, map_ids, num_envs = binding.shared(
             seed=seed,
@@ -347,17 +367,25 @@ class Drive(pufferlib.PufferEnv):
         self.truncations[:] = 0
         return self.observations, []
 
-    def _build_map_id_queue(self, batch_size):
-        """Ask the LevelSampler for a candidate map-id batch to hand to C, if enabled.
+    def _load_controllable_counts(self, map_dir, num_maps):
+        if self.level_sampler is None:
+            return None
+        path = os.path.join(map_dir, "controllable_counts.npy")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"{path} not found. Place controllable_counts.npy next to the map bins before sampling."
+            )
+        counts = np.load(path)
+        if counts.shape[0] < num_maps:
+            raise ValueError(
+                f"{path} has {counts.shape[0]} entries, but num_maps is {num_maps}."
+            )
+        return np.asarray(counts[:num_maps], dtype=np.int32)
 
-        Returns (map_id_queue, metrics): map_id_queue is an int32 ndarray, or
-        None when map_sampling_strategy is "uniform" (unchanged behavior --
-        binding.c's my_shared falls back to rand()). metrics is a dict for
-        logging, or {} when no queue was built.
-        """
+    def _build_map_id_queue(self, batch_size):
         if self.level_sampler is None:
             return None, {}
-        map_id_queue, metrics = self.level_sampler.sample_batch(batch_size)
+        map_id_queue, metrics = self.level_sampler.sample_until(self.controllable_counts, batch_size)
         return map_id_queue, metrics
 
     def _report_map_scores_to_sampler(self):
@@ -370,14 +398,52 @@ class Drive(pufferlib.PufferEnv):
         logs = self.get_env_logs()
         map_ids = []
         scores = []
+        mc_ready = self.map_score == "max_mc" and len(self._mc_rewards) > 0
+        if mc_ready:
+            rewards = np.stack(self._mc_rewards)
+            values = np.stack(self._mc_values)
+            dones = np.stack(self._mc_dones)
         for env_idx, log in enumerate(logs):
-            if not log:
+            if not log and not mc_ready:
                 continue
-            map_ids.append(self.map_ids[env_idx])
-            scores.append(log["episode_return"])
-        if map_ids:
+            map_id = int(self.map_ids[env_idx])
+            if mc_ready:
+                sl = slice(int(self.agent_offsets[env_idx]), int(self.agent_offsets[env_idx + 1]))
+                if sl.start == sl.stop:
+                    continue
+                # Writes LevelSampler.scores[map_id] and returns that buffer value.
+                score = self.level_sampler.score_max_mc(map_id, rewards[:, sl], values[:, sl], dones[:, sl])
+                map_ids.append(map_id)
+                scores.append(score)
+            elif log:
+                map_ids.append(map_id)
+                scores.append(log["episode_return"])
+        self._mc_rewards.clear()
+        self._mc_values.clear()
+        self._mc_dones.clear()
+        if map_ids and not mc_ready:
             self.level_sampler.update_batch(map_ids, scores)
-        return {}
+            scores = [float(self.level_sampler.scores[map_id]) for map_id in map_ids]
+        return {"map_ids": map_ids, "scores": scores}
+
+    def note_values(self, values):
+        self._pending_values = np.asarray(values, dtype=np.float32).reshape(-1)
+
+    def _record_max_mc_step(self):
+        if self.level_sampler is None or self.map_score != "max_mc":
+            return
+        if self._plr_value_buf is not None:
+            values = np.asarray(self._plr_value_buf, dtype=np.float32).reshape(-1)
+        elif self._pending_values is not None:
+            values = self._pending_values
+            self._pending_values = None
+        else:
+            return
+        if values.shape[0] != self.rewards.shape[0] or not np.isfinite(values).all():
+            return
+        self._mc_rewards.append(np.asarray(self.rewards, dtype=np.float32).copy())
+        self._mc_values.append(values.copy())
+        self._mc_dones.append(np.logical_or(self.terminals, self.truncations).copy())
 
     def resample_maps(self):
         """Resample environment maps."""
@@ -464,6 +530,7 @@ class Drive(pufferlib.PufferEnv):
         self.truncations[:] = 0
         self.actions[:] = actions
         binding.vec_step(self.c_envs)
+        self._record_max_mc_step()
 
         self.tick += 1
         info = []

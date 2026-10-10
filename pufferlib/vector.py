@@ -139,10 +139,15 @@ class Serial:
 
         actions = send_precheck(self, actions)
         rewards, dones, truncateds, self.infos = [], [], [], []
+        pending = getattr(self, "pending_plr_values", None)
+        if pending is not None:
+            pending = np.asarray(pending, dtype=np.float32).reshape(-1)
         ptr = 0
         for idx, env in enumerate(self.envs):
             end = ptr + self.agents_per_env[idx]
             atns = actions[ptr:end]
+            if pending is not None and hasattr(env, "note_values"):
+                env.note_values(pending[ptr:end])
             if env.done:
                 o, i = env.reset()
             else:
@@ -207,6 +212,7 @@ def _worker_process(
         truncations=np.ndarray(shape, dtype=bool, buffer=shm["truncateds"])[worker_idx],
         masks=np.ndarray(shape, dtype=bool, buffer=shm["masks"])[worker_idx],
         actions=atn_arr,
+        values=np.ndarray(shape, dtype=np.float32, buffer=shm["values"])[worker_idx],
     )
     buf["masks"][:] = True
 
@@ -345,6 +351,7 @@ class Multiprocessing:
             terminals=RawArray("b", num_agents),
             truncateds=RawArray("b", num_agents),
             masks=RawArray("b", num_agents),
+            values=RawArray("f", num_agents),
             semaphores=RawArray("c", num_workers),
             notify=RawArray("b", num_workers),
         )
@@ -358,9 +365,11 @@ class Multiprocessing:
             terminals=np.ndarray(shape, dtype=bool, buffer=self.shm["terminals"]),
             truncations=np.ndarray(shape, dtype=bool, buffer=self.shm["truncateds"]),
             masks=np.ndarray(shape, dtype=bool, buffer=self.shm["masks"]),
+            values=np.ndarray(shape, dtype=np.float32, buffer=self.shm["values"]),
             semaphores=np.ndarray(num_workers, dtype=np.uint8, buffer=self.shm["semaphores"]),
             notify=np.ndarray(num_workers, dtype=bool, buffer=self.shm["notify"]),
         )
+        self.buf["values"].fill(np.nan)
         self.buf["semaphores"][:] = MAIN
 
         from multiprocessing import Pipe, Process
@@ -501,6 +510,10 @@ class Multiprocessing:
 
         idxs = self.w_slice
         self.actions[idxs] = actions
+        pending = getattr(self, "pending_plr_values", None)
+        if pending is not None and "values" in self.buf:
+            vals = np.asarray(pending, dtype=np.float32).reshape(self.buf["values"][idxs].shape)
+            self.buf["values"][idxs] = vals
         self.buf["semaphores"][idxs] = STEP
 
     def async_reset(self, seed=0):

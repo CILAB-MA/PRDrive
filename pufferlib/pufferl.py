@@ -259,6 +259,15 @@ class PuffeRL:
 
         return (self.global_step - self.last_log_step) / (time.time() - self.last_log_time)
 
+    def _publish_plr_values(self, value):
+        """Hand V(s) to the env so MaxMC can score the map on the next step."""
+        driver = getattr(self.vecenv, "driver_env", None)
+        if driver is None or getattr(driver, "map_score", None) != "max_mc":
+            return
+        if getattr(driver, "level_sampler", None) is None:
+            return
+        self.vecenv.pending_plr_values = value.detach().float().reshape(-1).cpu().numpy()
+
     def evaluate(self):
         profile = self.profile
         epoch = self.epoch
@@ -376,6 +385,7 @@ class PuffeRL:
                         self.stats[k].append(v)
 
             profile("env", epoch)
+            self._publish_plr_values(value)
             self.vecenv.send(action)
 
         profile("eval_misc", epoch)
@@ -1468,32 +1478,32 @@ def verify(env_name, args=None, vecenv=None):
         max_frames = 91
         frame_count = 0
 
-    while True:
-        driver.render(draw_traces=True)
+        while True:
+            driver.render(draw_traces=True)
 
-        if verify_mode == "bc_policy":
-            with torch.no_grad():
-                ob_tensor = torch.as_tensor(ob).to(device)
-                logits_list = bc_policy.get_action_dist_logits(ob_tensor)
+            if verify_mode == "bc_policy":
+                with torch.no_grad():
+                    ob_tensor = torch.as_tensor(ob).to(device)
+                    logits_list = bc_policy.get_action_dist_logits(ob_tensor)
 
-                if len(logits_list) == 1:
-                    # Joint action space (classic dynamics)
-                    action = torch.argmax(logits_list[0], dim=-1, keepdim=True)
-                else:
-                    # Multi-head (delta_local)
-                    action = torch.stack([torch.argmax(l, dim=-1) for l in logits_list], dim=-1)
+                    if len(logits_list) == 1:
+                        # Joint action space (classic dynamics)
+                        action = torch.argmax(logits_list[0], dim=-1, keepdim=True)
+                    else:
+                        # Multi-head (delta_local)
+                        action = torch.stack([torch.argmax(l, dim=-1) for l in logits_list], dim=-1)
 
-                action = action.cpu().numpy().reshape(vecenv.action_space.shape)
-        else:
-            # Expert replay / inferred expert actions: env handles actions internally, just need a shape
-            action = vecenv.action_space.sample()
+                    action = action.cpu().numpy().reshape(vecenv.action_space.shape)
+            else:
+                # Expert replay / inferred expert actions: env handles actions internally, just need a shape
+                action = vecenv.action_space.sample()
 
-        ob, reward, done, truncated, info = vecenv.step(action)
+            ob, reward, done, truncated, info = vecenv.step(action)
 
-        if driver.render_mode == 1:
-            frame_count += 1
-            if frame_count >= max_frames or done.all() or truncated.all():
-                break
+            if driver.render_mode == 1:
+                frame_count += 1
+                if frame_count >= max_frames or done.all() or truncated.all():
+                    break
 
     vecenv.close()
 

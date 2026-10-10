@@ -240,8 +240,8 @@ class WOSACEvaluator:
                             action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                             action_np = action.cpu().numpy().reshape(puffer_env.action_space.shape)
 
-                        if isinstance(logits, torch.distributions.Normal):
-                            action_np = np.clip(action_np, puffer_env.action_space.low, puffer_env.action_space.high)
+                if isinstance(logits, torch.distributions.Normal):
+                    action_np = np.clip(action_np, puffer_env.action_space.low, puffer_env.action_space.high)
 
                 obs, rewards, terminals, truncations, infos = puffer_env.step(action_np)
 
