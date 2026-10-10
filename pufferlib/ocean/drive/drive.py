@@ -92,6 +92,9 @@ class Drive(pufferlib.PufferEnv):
         map_score="return",  # "return" or "max_mc" (only used when a LevelSampler is active)
         map_agent_reduce="mean",  # "mean", "max", or "min": agent MaxMC scores -> one map score
         score_transform="rank",  # "rank" or "power". MaxMC requires "rank".
+        map_replay_prob=0.5,  # d: probability of replaying a seen map
+        map_score_temperature=2.0,  # beta: rank temperature for PLR-MaxMC
+        map_staleness_coef=0.3,  # rho in the PLR-MaxMC table: staleness mix
     ):
         # env
         self.dt = dt
@@ -108,6 +111,9 @@ class Drive(pufferlib.PufferEnv):
             raise ValueError(f"map_score must be 'return' or 'max_mc'. Got: {map_score!r}")
         self.map_agent_reduce = map_agent_reduce
         self.score_transform = score_transform
+        self.map_replay_prob = map_replay_prob
+        self.map_score_temperature = map_score_temperature
+        self.map_staleness_coef = map_staleness_coef
         if map_score == "max_mc" and score_transform != "rank":
             raise ValueError(
                 "map_score 'max_mc' can be negative, so score_transform must be 'rank'. "
@@ -120,6 +126,9 @@ class Drive(pufferlib.PufferEnv):
                 strategy="prioritized",
                 agent_aggregate=map_agent_reduce,
                 score_transform=score_transform,
+                nu=map_replay_prob,
+                temperature=map_score_temperature,
+                staleness_coef=map_staleness_coef,
             )
         elif map_sampling_strategy == "sequential":
             self.level_sampler = LevelSampler(
@@ -128,6 +137,9 @@ class Drive(pufferlib.PufferEnv):
                 strategy="sequential",
                 agent_aggregate=map_agent_reduce,
                 score_transform=score_transform,
+                nu=map_replay_prob,
+                temperature=map_score_temperature,
+                staleness_coef=map_staleness_coef,
             )
         elif map_sampling_strategy == "uniform":
             self.level_sampler = None

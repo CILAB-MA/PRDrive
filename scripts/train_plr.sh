@@ -71,6 +71,7 @@ echo "  exp=${EXP_NAME}"
 echo "  data_dir=${DATA_DIR}"
 echo "  map_dir=${MAP_DIR}"
 echo "  strategy=prioritized score=${MAP_SCORE} reduce=${MAP_AGENT_REDUCE} transform=rank"
+echo "  replay_prob=0.5 temperature=2 staleness=0.3"
 echo "  seeds=${SEEDS[*]}"
 echo "  total_timesteps=${TOTAL_TIMESTEPS}"
 echo "  num_maps=${NUM_MAPS}"
@@ -85,6 +86,9 @@ for SEED in "${SEEDS[@]}"; do
     --env.map-score "${MAP_SCORE}" \
     --env.map-agent-reduce "${MAP_AGENT_REDUCE}" \
     --env.score-transform rank \
+    --env.map-replay-prob 0.5 \
+    --env.map-score-temperature 2.0 \
+    --env.map-staleness-coef 0.3 \
     --env.map-sampler-seed "${SEED}" \
     --env.map-dir "${MAP_DIR}" \
     --env.num-maps "${NUM_MAPS}" \
