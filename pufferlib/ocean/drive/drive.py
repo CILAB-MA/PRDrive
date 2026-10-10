@@ -91,6 +91,7 @@ class Drive(pufferlib.PufferEnv):
         map_sampler_seed=None,
         map_score="return",  # "return" or "max_mc" (only used when a LevelSampler is active)
         map_agent_reduce="mean",  # "mean", "max", or "min": agent MaxMC scores -> one map score
+        score_transform="rank",  # "rank" or "power". MaxMC requires "rank".
     ):
         # env
         self.dt = dt
@@ -106,13 +107,27 @@ class Drive(pufferlib.PufferEnv):
         if map_score not in ("return", "max_mc"):
             raise ValueError(f"map_score must be 'return' or 'max_mc'. Got: {map_score!r}")
         self.map_agent_reduce = map_agent_reduce
+        self.score_transform = score_transform
+        if map_score == "max_mc" and score_transform != "rank":
+            raise ValueError(
+                "map_score 'max_mc' can be negative, so score_transform must be 'rank'. "
+                f"Got: {score_transform!r}"
+            )
         if map_sampling_strategy == "prioritized":
             self.level_sampler = LevelSampler(
-                num_maps=num_maps, seed=map_sampler_seed, strategy="prioritized", agent_aggregate=map_agent_reduce
+                num_maps=num_maps,
+                seed=map_sampler_seed,
+                strategy="prioritized",
+                agent_aggregate=map_agent_reduce,
+                score_transform=score_transform,
             )
         elif map_sampling_strategy == "sequential":
             self.level_sampler = LevelSampler(
-                num_maps=num_maps, seed=map_sampler_seed, strategy="sequential", agent_aggregate=map_agent_reduce
+                num_maps=num_maps,
+                seed=map_sampler_seed,
+                strategy="sequential",
+                agent_aggregate=map_agent_reduce,
+                score_transform=score_transform,
             )
         elif map_sampling_strategy == "uniform":
             self.level_sampler = None

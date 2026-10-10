@@ -87,7 +87,9 @@ class LevelSampler:
         if transform == "power":
             e = 0.0 if self.staleness_coef > 0 else self.eps
             return (values + e) ** (1.0 / temperature)
-        # "rank": highest value gets rank 1, weight ~ 1 / rank^(1/temperature)
+        # "rank": highest value gets rank 1, weight 1 / rank^(1/temperature).
+        # Matches minimax PLR when use_score_ranks=True. Sign of the score
+        # only changes order, so negative MaxMC scores stay valid weights.
         order = np.flip(values.argsort())
         ranks = np.empty_like(order)
         ranks[order] = np.arange(len(order)) + 1
@@ -95,7 +97,12 @@ class LevelSampler:
 
     def _sample_weights(self):
         """Sampling distribution over already-seen maps, blending score and staleness."""
-        weights = self._transform(self.score_transform, self.temperature, self.scores)
+        score_values = np.array(self.scores, copy=True)
+        if self.score_transform == "rank":
+            # Unseen maps are not scored. Keep them below every real score so
+            # they do not take the top ranks away from negative MaxMC scores.
+            score_values[~self.seen] = -np.inf
+        weights = self._transform(self.score_transform, self.temperature, score_values)
         weights = weights * self.seen  # never-scored maps get zero weight here
         total = weights.sum()
         if total > 0:
@@ -119,8 +126,10 @@ class LevelSampler:
 
     def _sample_replay(self):
         weights = self._sample_weights()
-        if not np.isclose(weights.sum(), 0.0):
-            map_id = int(self._rng.choice(self.num_maps, p=weights))
+        weights = np.maximum(weights, 0.0)
+        total = float(weights.sum())
+        if total > 0 and np.isfinite(total):
+            map_id = int(self._rng.choice(self.num_maps, p=weights / total))
         else:
             # Nothing scored yet despite being "seen" (shouldn't normally happen) -- fall back.
             map_id = int(self._rng.integers(self.num_maps))

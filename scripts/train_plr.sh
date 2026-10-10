@@ -70,7 +70,7 @@ echo "  GPU=${GPU_ID}"
 echo "  exp=${EXP_NAME}"
 echo "  data_dir=${DATA_DIR}"
 echo "  map_dir=${MAP_DIR}"
-echo "  strategy=prioritized score=${MAP_SCORE} reduce=${MAP_AGENT_REDUCE}"
+echo "  strategy=prioritized score=${MAP_SCORE} reduce=${MAP_AGENT_REDUCE} transform=rank"
 echo "  seeds=${SEEDS[*]}"
 echo "  total_timesteps=${TOTAL_TIMESTEPS}"
 echo "  num_maps=${NUM_MAPS}"
@@ -84,6 +84,7 @@ for SEED in "${SEEDS[@]}"; do
     --env.map-sampling-strategy prioritized \
     --env.map-score "${MAP_SCORE}" \
     --env.map-agent-reduce "${MAP_AGENT_REDUCE}" \
+    --env.score-transform rank \
     --env.map-sampler-seed "${SEED}" \
     --env.map-dir "${MAP_DIR}" \
     --env.num-maps "${NUM_MAPS}" \
