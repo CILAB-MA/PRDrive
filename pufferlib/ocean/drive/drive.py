@@ -89,12 +89,14 @@ class Drive(pufferlib.PufferEnv):
         async_resets=True,
         map_sampling_strategy="uniform",  # "uniform" (unchanged rand() in C) or "prioritized" (PLR LevelSampler)
         map_sampler_seed=None,
+        eval_map_log_path=None,  # eval only: save per-map logs (see _dump_map_logs)
     ):
         # env
         self.dt = dt
         self.render_mode = render_mode
         self.num_maps = num_maps
         self.report_interval = report_interval
+        self.eval_map_log_path = eval_map_log_path
 
         # Which map gets loaded next: "uniform" leaves it to C's rand() (unchanged
         # default behavior); "prioritized" hands C a PLR-ordered candidate queue
@@ -381,6 +383,8 @@ class Drive(pufferlib.PufferEnv):
 
     def resample_maps(self):
         """Resample environment maps."""
+        if self.eval_map_log_path:
+            self._dump_map_logs()
         self._report_map_scores_to_sampler()
         self.tick = 0
         binding.vec_close(self.c_envs)
@@ -467,7 +471,9 @@ class Drive(pufferlib.PufferEnv):
 
         self.tick += 1
         info = []
-        if self.tick % self.report_interval == 0:
+        if self.eval_map_log_path and self.tick % self.report_interval == 0:
+            self._dump_map_logs()
+        elif self.tick % self.report_interval == 0:
             if per_env_logs:  # Get the stats for every separate env
                 logs = self.get_env_logs()
                 if any(logs):
@@ -694,6 +700,35 @@ class Drive(pufferlib.PufferEnv):
         """Get log statistics for a single environment."""
         num_agents = self.agent_offsets[env_idx + 1] - self.agent_offsets[env_idx]
         return binding.env_log(self.env_ids[env_idx], num_agents)
+
+    def _dump_map_logs(self):
+        """Eval only: append each env's (= one map's) log with its map_id to a JSONL file.
+
+        One file per worker process (<base>.<pid>.jsonl), append-only, so 16 workers never
+        overwrite each other. Reading a log clears it in C (env_log), so every read is saved.
+        """
+        import json
+        import time
+
+        rows = []
+        for i, log in enumerate(self.get_env_logs()):
+            if not log:
+                continue
+            row = {k: float(v) for k, v in log.items()}
+            row["map_id"] = int(self.map_ids[i])
+            rows.append(row)
+        if not rows:
+            return
+        base = self.eval_map_log_path
+        if base.endswith(".jsonl"):
+            base = base[:-6]
+        out = f"{base}.{os.getpid()}.jsonl"
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+        now = time.time()
+        with open(out, "a", encoding="utf-8") as f:
+            for row in rows:
+                row["_time"] = now
+                f.write(json.dumps(row) + "\n")
 
     def get_env_logs(self):
         """Get log statistics for all environments (unaggregated)."""
