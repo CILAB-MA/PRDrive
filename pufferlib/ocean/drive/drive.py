@@ -87,8 +87,14 @@ class Drive(pufferlib.PufferEnv):
         obs_partner_noise_speed=0.0,
         obs_partner_noise_pos=0.0,
         async_resets=True,
-        map_sampling_strategy="uniform",  # "uniform" (unchanged rand() in C) or "prioritized" (PLR LevelSampler)
+        map_sampling_strategy="uniform",  # "uniform", "prioritized", or "sequential"
         map_sampler_seed=None,
+        map_score="return",  # "return" or "max_mc" (only used when a LevelSampler is active)
+        map_agent_reduce="mean",  # "mean", "max", or "min": agent MaxMC scores -> one map score
+        score_transform="rank",  # "rank" or "power". MaxMC requires "rank".
+        map_replay_prob=0.5,  # d: probability of replaying a seen map
+        map_score_temperature=2.0,  # beta: rank temperature for PLR-MaxMC
+        map_staleness_coef=0.3,  # rho in the PLR-MaxMC table: staleness mix
     ):
         # env
         self.dt = dt
@@ -100,14 +106,53 @@ class Drive(pufferlib.PufferEnv):
         # default behavior); "prioritized" hands C a PLR-ordered candidate queue
         # instead (see binding.c: my_shared's map_id_queue).
         self.map_sampling_strategy = map_sampling_strategy
+        self.map_score = map_score
+        if map_score not in ("return", "max_mc"):
+            raise ValueError(f"map_score must be 'return' or 'max_mc'. Got: {map_score!r}")
+        self.map_agent_reduce = map_agent_reduce
+        self.score_transform = score_transform
+        self.map_replay_prob = map_replay_prob
+        self.map_score_temperature = map_score_temperature
+        self.map_staleness_coef = map_staleness_coef
+        if map_score == "max_mc" and score_transform != "rank":
+            raise ValueError(
+                "map_score 'max_mc' can be negative, so score_transform must be 'rank'. "
+                f"Got: {score_transform!r}"
+            )
         if map_sampling_strategy == "prioritized":
-            self.level_sampler = LevelSampler(num_maps=num_maps, seed=map_sampler_seed)
+            self.level_sampler = LevelSampler(
+                num_maps=num_maps,
+                seed=map_sampler_seed,
+                strategy="prioritized",
+                agent_aggregate=map_agent_reduce,
+                score_transform=score_transform,
+                nu=map_replay_prob,
+                temperature=map_score_temperature,
+                staleness_coef=map_staleness_coef,
+            )
+        elif map_sampling_strategy == "sequential":
+            self.level_sampler = LevelSampler(
+                num_maps=num_maps,
+                seed=map_sampler_seed,
+                strategy="sequential",
+                agent_aggregate=map_agent_reduce,
+                score_transform=score_transform,
+                nu=map_replay_prob,
+                temperature=map_score_temperature,
+                staleness_coef=map_staleness_coef,
+            )
         elif map_sampling_strategy == "uniform":
             self.level_sampler = None
         else:
             raise ValueError(
-                f"map_sampling_strategy must be 'uniform' or 'prioritized'. Got: {map_sampling_strategy!r}"
+                f"map_sampling_strategy must be 'uniform', 'prioritized', or 'sequential'. Got: {map_sampling_strategy!r}"
             )
+        self.controllable_counts = self._load_controllable_counts(map_dir, num_maps)
+        self._plr_value_buf = buf.get("values") if isinstance(buf, dict) and "values" in buf else None
+        self._pending_values = None
+        self._mc_rewards = []
+        self._mc_values = []
+        self._mc_dones = []
         self.reward_vehicle_collision = reward_vehicle_collision
         self.reward_offroad_collision = reward_offroad_collision
         self.reward_goal = reward_goal
@@ -237,7 +282,7 @@ class Drive(pufferlib.PufferEnv):
 
         self._action_type_flag = 0 if action_type == "discrete" else 1
 
-        # Check if resources directory exists
+        # Check if resources directory exists. Names match C `%03d`: map_000.bin, map_1000.bin.
         binary_path = f"{map_dir}/map_000.bin"
         if not os.path.exists(binary_path):
             raise FileNotFoundError(
@@ -252,6 +297,8 @@ class Drive(pufferlib.PufferEnv):
             )
 
         # Iterate through all maps to count total agents that can be initialized for each map
+        self._map_load_idx = 0
+        self.map_load_log = []
         map_id_queue, _ = self._build_map_id_queue(num_agents)
         agent_offsets, map_ids, num_envs = binding.shared(
             seed=seed,
@@ -347,17 +394,25 @@ class Drive(pufferlib.PufferEnv):
         self.truncations[:] = 0
         return self.observations, []
 
-    def _build_map_id_queue(self, batch_size):
-        """Ask the LevelSampler for a candidate map-id batch to hand to C, if enabled.
+    def _load_controllable_counts(self, map_dir, num_maps):
+        if self.level_sampler is None:
+            return None
+        path = os.path.join(map_dir, "controllable_counts.npy")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"{path} not found. Place controllable_counts.npy next to the map bins before sampling."
+            )
+        counts = np.load(path)
+        if counts.shape[0] < num_maps:
+            raise ValueError(
+                f"{path} has {counts.shape[0]} entries, but num_maps is {num_maps}."
+            )
+        return np.asarray(counts[:num_maps], dtype=np.int32)
 
-        Returns (map_id_queue, metrics): map_id_queue is an int32 ndarray, or
-        None when map_sampling_strategy is "uniform" (unchanged behavior --
-        binding.c's my_shared falls back to rand()). metrics is a dict for
-        logging, or {} when no queue was built.
-        """
+    def _build_map_id_queue(self, batch_size):
         if self.level_sampler is None:
             return None, {}
-        map_id_queue, metrics = self.level_sampler.sample_batch(batch_size)
+        map_id_queue, metrics = self.level_sampler.sample_until(self.controllable_counts, batch_size)
         return map_id_queue, metrics
 
     def _report_map_scores_to_sampler(self):
@@ -370,14 +425,52 @@ class Drive(pufferlib.PufferEnv):
         logs = self.get_env_logs()
         map_ids = []
         scores = []
+        mc_ready = self.map_score == "max_mc" and len(self._mc_rewards) > 0
+        if mc_ready:
+            rewards = np.stack(self._mc_rewards)
+            values = np.stack(self._mc_values)
+            dones = np.stack(self._mc_dones)
         for env_idx, log in enumerate(logs):
-            if not log:
+            if not log and not mc_ready:
                 continue
-            map_ids.append(self.map_ids[env_idx])
-            scores.append(log["episode_return"])
-        if map_ids:
+            map_id = int(self.map_ids[env_idx])
+            if mc_ready:
+                sl = slice(int(self.agent_offsets[env_idx]), int(self.agent_offsets[env_idx + 1]))
+                if sl.start == sl.stop:
+                    continue
+                # Writes LevelSampler.scores[map_id] and returns that buffer value.
+                score = self.level_sampler.score_max_mc(map_id, rewards[:, sl], values[:, sl], dones[:, sl])
+                map_ids.append(map_id)
+                scores.append(score)
+            elif log:
+                map_ids.append(map_id)
+                scores.append(log["episode_return"])
+        self._mc_rewards.clear()
+        self._mc_values.clear()
+        self._mc_dones.clear()
+        if map_ids and not mc_ready:
             self.level_sampler.update_batch(map_ids, scores)
-        return {}
+            scores = [float(self.level_sampler.scores[map_id]) for map_id in map_ids]
+        return {"map_ids": map_ids, "scores": scores}
+
+    def note_values(self, values):
+        self._pending_values = np.asarray(values, dtype=np.float32).reshape(-1)
+
+    def _record_max_mc_step(self):
+        if self.level_sampler is None or self.map_score != "max_mc":
+            return
+        if self._plr_value_buf is not None:
+            values = np.asarray(self._plr_value_buf, dtype=np.float32).reshape(-1)
+        elif self._pending_values is not None:
+            values = self._pending_values
+            self._pending_values = None
+        else:
+            return
+        if values.shape[0] != self.rewards.shape[0] or not np.isfinite(values).all():
+            return
+        self._mc_rewards.append(np.asarray(self.rewards, dtype=np.float32).copy())
+        self._mc_values.append(values.copy())
+        self._mc_dones.append(np.logical_or(self.terminals, self.truncations).copy())
 
     def resample_maps(self):
         """Resample environment maps."""
@@ -464,6 +557,7 @@ class Drive(pufferlib.PufferEnv):
         self.truncations[:] = 0
         self.actions[:] = actions
         binding.vec_step(self.c_envs)
+        self._record_max_mc_step()
 
         self.tick += 1
         info = []
@@ -1153,6 +1247,8 @@ def process_all_maps(
     data_folder="data/processed/training",
     max_maps=50_000,
     num_workers=None,
+    output_dir=None,
+    index_offset=0,
 ):
     """Process all maps and save them as binaries using multiprocessing
 
@@ -1160,45 +1256,70 @@ def process_all_maps(
         data_folder: Path to the folder containing JSON map files
         max_maps: Maximum number of maps to process
         num_workers: Number of parallel workers (defaults to cpu_count())
+        output_dir: Destination for ``map_XXX.bin`` files. Defaults to
+            ``resources/drive/binaries/{dataset_name}`` (basename of data_folder).
+        index_offset: Added to the per-folder index so several folders can share
+            one output directory. Names match the C loader's ``map_%03d.bin``
+            (minimum 3 digits: ``map_000.bin``, ``map_1000.bin``).
+
+    Returns:
+        Number of JSON files considered (for chaining ``index_offset``).
     """
     from pathlib import Path
 
     if num_workers is None:
         num_workers = cpu_count()
 
-    # Path to the training data
     data_dir = Path(data_folder)
     dataset_name = data_dir.name
 
-    # Create the binaries directory if it doesn't exist
-    binary_dir = Path(f"resources/drive/binaries/{dataset_name}")
+    if output_dir is None:
+        binary_dir = Path(f"resources/drive/binaries/{dataset_name}")
+    else:
+        binary_dir = Path(output_dir)
     binary_dir.mkdir(parents=True, exist_ok=True)
 
-    # Get all JSON files in the training directory
     json_files = sorted(data_dir.glob("*.json"))
+    if not json_files:
+        print(f"No JSON files in {data_dir}")
+        return 0
 
-    # Prepare arguments for parallel processing
+    n = min(len(json_files), max_maps)
+    print(
+        f"Processing {n}/{len(json_files)} maps from {data_dir} -> {binary_dir} "
+        f"(offset={index_offset}, {num_workers} workers)"
+    )
+
     tasks = []
+    skipped = 0
     for i, map_path in enumerate(json_files[:max_maps]):
-        binary_file = f"map_{i:03d}.bin"
+        binary_file = f"map_{i + int(index_offset):03d}.bin"
         binary_path = binary_dir / binary_file
+        # Resume: keep non-empty bins already written (kill-safe).
+        if binary_path.is_file() and binary_path.stat().st_size > 0:
+            skipped += 1
+            continue
         tasks.append((i, map_path, binary_path))
+    print(f"  skip existing={skipped}  remaining={len(tasks)}")
+    if not tasks:
+        print(f"Done {dataset_name}: nothing to do -> {binary_dir}")
+        return n
 
-    # Process maps in parallel with progress bar
     with Pool(num_workers) as pool:
         results = list(
-            tqdm(pool.imap(_process_single_map, tasks), total=len(tasks), desc="Processing maps", unit="map")
+            tqdm(pool.imap(_process_single_map, tasks), total=len(tasks), desc=f"{dataset_name}", unit="map")
         )
 
-    # Collect statistics
     successful = sum(1 for _, _, success, _ in results if success)
     failed = sum(1 for _, _, success, _ in results if not success)
+    print(f"Done {dataset_name}: {successful} ok, {failed} failed -> {binary_dir}")
 
     if failed > 0:
         print(f"\nFailed {failed}/{len(results)} files:")
         for i, name, success, error in results:
             if not success:
                 print(f"  {name}: {error}")
+    return n
 
 
 def test_performance(timeout=10, atn_cache=12, num_agents=12):
@@ -1244,7 +1365,50 @@ def test_performance(timeout=10, atn_cache=12, num_agents=12):
 
 
 if __name__ == "__main__":
-    # analyze_action_space(data_folder="data/processed/training_50k", max_maps=10000)
-    # test_performance()
-    # Process the train dataset
-    process_all_maps(data_folder="data/processed/training")
+    import argparse
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description="Convert WOMD/Carla JSON maps to Drive binaries")
+    parser.add_argument(
+        "--data-root",
+        type=str,
+        default=None,
+        help="Parent folder whose subdirs (e.g. training/validation) each contain *.json",
+    )
+    parser.add_argument(
+        "--data-folder",
+        type=str,
+        default=None,
+        help="Single folder of *.json (legacy). Ignored if --data-root is set.",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=str,
+        default="resources/drive/binaries",
+        help="Root for binaries; writes {output_root}/{subdir}/map_XXX.bin",
+    )
+    parser.add_argument("--max-maps", type=int, default=50_000)
+    parser.add_argument("--num-workers", type=int, default=None)
+    cli = parser.parse_args()
+
+    if cli.data_root:
+        root = Path(cli.data_root)
+        subdirs = sorted(p for p in root.iterdir() if p.is_dir())
+        if not subdirs:
+            raise SystemExit(f"No subdirectories under {root}")
+        for sub in subdirs:
+            process_all_maps(
+                data_folder=str(sub),
+                max_maps=cli.max_maps,
+                num_workers=cli.num_workers,
+                output_dir=str(Path(cli.output_root) / sub.name),
+            )
+    else:
+        folder = cli.data_folder or "data/processed/training"
+        name = Path(folder).name
+        process_all_maps(
+            data_folder=folder,
+            max_maps=cli.max_maps,
+            num_workers=cli.num_workers,
+            output_dir=str(Path(cli.output_root) / name),
+        )
