@@ -9,6 +9,7 @@ import pufferlib
 import math
 from enum import IntEnum
 from pufferlib.ocean.drive import binding
+from pufferlib.ocean.drive.level_sampler import LevelSampler
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -86,12 +87,29 @@ class Drive(pufferlib.PufferEnv):
         obs_partner_noise_speed=0.0,
         obs_partner_noise_pos=0.0,
         async_resets=True,
+        map_sampling_strategy="uniform",  # "uniform" (unchanged rand() in C) or "prioritized" (PLR LevelSampler)
+        map_sampler_seed=None,
+        eval_map_log_path=None,  # eval only: save per-map logs (see _dump_map_logs)
     ):
         # env
         self.dt = dt
         self.render_mode = render_mode
         self.num_maps = num_maps
         self.report_interval = report_interval
+        self.eval_map_log_path = eval_map_log_path
+
+        # Which map gets loaded next: "uniform" leaves it to C's rand() (unchanged
+        # default behavior); "prioritized" hands C a PLR-ordered candidate queue
+        # instead (see binding.c: my_shared's map_id_queue).
+        self.map_sampling_strategy = map_sampling_strategy
+        if map_sampling_strategy == "prioritized":
+            self.level_sampler = LevelSampler(num_maps=num_maps, seed=map_sampler_seed)
+        elif map_sampling_strategy == "uniform":
+            self.level_sampler = None
+        else:
+            raise ValueError(
+                f"map_sampling_strategy must be 'uniform' or 'prioritized'. Got: {map_sampling_strategy!r}"
+            )
         self.reward_vehicle_collision = reward_vehicle_collision
         self.reward_offroad_collision = reward_offroad_collision
         self.reward_goal = reward_goal
@@ -236,9 +254,11 @@ class Drive(pufferlib.PufferEnv):
             )
 
         # Iterate through all maps to count total agents that can be initialized for each map
+        map_id_queue, _ = self._build_map_id_queue(num_agents)
         agent_offsets, map_ids, num_envs = binding.shared(
             seed=seed,
             map_dir=map_dir,
+            map_id_queue=map_id_queue,
             num_agents=num_agents,
             num_maps=num_maps,
             init_mode=self.init_mode,
@@ -329,13 +349,50 @@ class Drive(pufferlib.PufferEnv):
         self.truncations[:] = 0
         return self.observations, []
 
+    def _build_map_id_queue(self, batch_size):
+        """Ask the LevelSampler for a candidate map-id batch to hand to C, if enabled.
+
+        Returns (map_id_queue, metrics): map_id_queue is an int32 ndarray, or
+        None when map_sampling_strategy is "uniform" (unchanged behavior --
+        binding.c's my_shared falls back to rand()). metrics is a dict for
+        logging, or {} when no queue was built.
+        """
+        if self.level_sampler is None:
+            return None, {}
+        map_id_queue, metrics = self.level_sampler.sample_batch(batch_size)
+        return map_id_queue, metrics
+
+    def _report_map_scores_to_sampler(self):
+        """Feed each env's episode return back into the LevelSampler, keyed by
+        the map it was just running, before those envs get closed out in
+        resample_maps(). No-op when map_sampling_strategy is "uniform".
+        """
+        if self.level_sampler is None:
+            return {}
+        logs = self.get_env_logs()
+        map_ids = []
+        scores = []
+        for env_idx, log in enumerate(logs):
+            if not log:
+                continue
+            map_ids.append(self.map_ids[env_idx])
+            scores.append(log["episode_return"])
+        if map_ids:
+            self.level_sampler.update_batch(map_ids, scores)
+        return {}
+
     def resample_maps(self):
         """Resample environment maps."""
+        if self.eval_map_log_path:
+            self._dump_map_logs()
+        self._report_map_scores_to_sampler()
         self.tick = 0
         binding.vec_close(self.c_envs)
         resample_seed = self.seed + self._resample_count
+        map_id_queue, _ = self._build_map_id_queue(self.num_agents)
         agent_offsets, map_ids, num_envs = binding.shared(
             seed=resample_seed,
+            map_id_queue=map_id_queue,
             num_agents=self.num_agents,
             num_maps=self.num_maps,
             init_mode=self.init_mode,
@@ -414,7 +471,9 @@ class Drive(pufferlib.PufferEnv):
 
         self.tick += 1
         info = []
-        if self.tick % self.report_interval == 0:
+        if self.eval_map_log_path and self.tick % self.report_interval == 0:
+            self._dump_map_logs()
+        elif self.tick % self.report_interval == 0:
             if per_env_logs:  # Get the stats for every separate env
                 logs = self.get_env_logs()
                 if any(logs):
@@ -641,6 +700,35 @@ class Drive(pufferlib.PufferEnv):
         """Get log statistics for a single environment."""
         num_agents = self.agent_offsets[env_idx + 1] - self.agent_offsets[env_idx]
         return binding.env_log(self.env_ids[env_idx], num_agents)
+
+    def _dump_map_logs(self):
+        """Eval only: append each env's (= one map's) log with its map_id to a JSONL file.
+
+        One file per worker process (<base>.<pid>.jsonl), append-only, so 16 workers never
+        overwrite each other. Reading a log clears it in C (env_log), so every read is saved.
+        """
+        import json
+        import time
+
+        rows = []
+        for i, log in enumerate(self.get_env_logs()):
+            if not log:
+                continue
+            row = {k: float(v) for k, v in log.items()}
+            row["map_id"] = int(self.map_ids[i])
+            rows.append(row)
+        if not rows:
+            return
+        base = self.eval_map_log_path
+        if base.endswith(".jsonl"):
+            base = base[:-6]
+        out = f"{base}.{os.getpid()}.jsonl"
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+        now = time.time()
+        with open(out, "a", encoding="utf-8") as f:
+            for row in rows:
+                row["_time"] = now
+                f.write(json.dumps(row) + "\n")
 
     def get_env_logs(self):
         """Get log statistics for all environments (unaggregated)."""

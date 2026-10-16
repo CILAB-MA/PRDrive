@@ -87,6 +87,31 @@ static PyObject *my_shared(PyObject *self, PyObject *args, PyObject *kwargs) {
     int seed = unpack(kwargs, "seed");
     srand(seed);
 
+    // Optional: a Python-provided, priority-ordered list of candidate map ids
+    // (e.g. from a PLR LevelSampler). When present, this loop consumes ids
+    // from it instead of calling rand() -- Python decides *which* maps are
+    // worth trying, C still decides *how many* it takes to fill the agent
+    // budget, since that count depends on how many controllable agents each
+    // map happens to contain.
+    PyObject *map_id_queue_obj = PyDict_GetItemString(kwargs, "map_id_queue");
+    int32_t *map_id_queue = NULL;
+    Py_ssize_t map_id_queue_len = 0;
+    if (map_id_queue_obj && map_id_queue_obj != Py_None) {
+        if (!PyObject_TypeCheck(map_id_queue_obj, &PyArray_Type)) {
+            PyErr_SetString(PyExc_TypeError, "map_id_queue must be a NumPy array");
+            return NULL;
+        }
+        PyArrayObject *queue_arr = (PyArrayObject *)map_id_queue_obj;
+        if (!PyArray_ISCONTIGUOUS(queue_arr) || PyArray_TYPE(queue_arr) != NPY_INT32) {
+            PyErr_SetString(PyExc_ValueError, "map_id_queue must be a contiguous int32 NumPy array");
+            return NULL;
+        }
+        map_id_queue = (int32_t *)PyArray_DATA(queue_arr);
+        map_id_queue_len = PyArray_SIZE(queue_arr);
+    }
+    int map_id_queue_pos = 0;
+    int map_id_queue_exhausted_warned = 0;
+
     int total_agent_count = 0;
     int env_count = 0;
     int max_envs = num_agents;
@@ -102,8 +127,27 @@ static PyObject *my_shared(PyObject *self, PyObject *args, PyObject *kwargs) {
         char map_file[512];
 
         // printf("Sampling map for env %d (total agents so far: %d)\n", env_count, total_agent_count);
-        //   Always sample randomly with replacement
-        int map_id = rand() % num_maps;
+        // Take the next candidate from Python's priority queue if one was
+        // provided, otherwise sample randomly with replacement (unchanged).
+        int map_id;
+        if (map_id_queue != NULL) {
+            if (map_id_queue_pos < map_id_queue_len) {
+                map_id = (int)map_id_queue[map_id_queue_pos++];
+            } else {
+                // Queue ran out before the agent budget was met -- fall back
+                // to random rather than hang. Should be rare if the caller
+                // sizes the batch generously (see LevelSampler.sample_batch).
+                if (!map_id_queue_exhausted_warned) {
+                    printf("WARNING: map_id_queue exhausted after %d entries; falling back to random "
+                           "sampling for the rest of this batch\n",
+                           (int)map_id_queue_len);
+                    map_id_queue_exhausted_warned = 1;
+                }
+                map_id = rand() % num_maps;
+            }
+        } else {
+            map_id = rand() % num_maps;
+        }
 
         // printf("Sampling map_id: %d\n", map_id);
 
