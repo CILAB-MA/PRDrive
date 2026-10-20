@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Train puffer_drive with Prioritized Level Replay.
 #
-# Overrides map_sampling_strategy to prioritized. Map scores are MaxMC
-# (map_score=max_mc), reduced across agents with map_agent_reduce, then
-# stored on the sampler. The queue length comes from controllable_counts.npy
-# next to the training bins.
+# Overrides map_sampling_strategy to prioritized. Map scores default to MaxMC
+# (MAP_SCORE=max_mc; also return, pvl, learnability). The queue length comes
+# from controllable_counts.npy next to the training bins.
 #
 # Usage:
 #   ./scripts/train_plr.sh 0 plr_10k
@@ -15,8 +14,7 @@
 #   $2  experiment name; checkpoints go to /data/prdrive/experiments/<name>/
 #
 # Seeds are the three values below. --train.seed resets the vecenv,
-# --vec.seed is the env/map seed passed into Drive, and --env.map-sampler-seed
-# seeds the PLR sampler.
+# --vec.seed is the env/map seed passed into Drive (and LevelSampler).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -45,7 +43,6 @@ SEEDS=(11 3 42)
 TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-2000000000}"
 NUM_MAPS="${NUM_MAPS:-10000}"
 MAP_SCORE="${MAP_SCORE:-max_mc}"
-MAP_AGENT_REDUCE="${MAP_AGENT_REDUCE:-mean}"
 
 if [[ ! -f "${COUNTS}" ]]; then
   echo "missing ${COUNTS}" >&2
@@ -70,8 +67,7 @@ echo "  GPU=${GPU_ID}"
 echo "  exp=${EXP_NAME}"
 echo "  data_dir=${DATA_DIR}"
 echo "  map_dir=${MAP_DIR}"
-echo "  strategy=prioritized score=${MAP_SCORE} reduce=${MAP_AGENT_REDUCE} transform=rank"
-echo "  replay_prob=0.5 temperature=2 staleness=0.3"
+echo "  strategy=prioritized score=${MAP_SCORE}"
 echo "  seeds=${SEEDS[*]}"
 echo "  total_timesteps=${TOTAL_TIMESTEPS}"
 echo "  num_maps=${NUM_MAPS}"
@@ -84,12 +80,6 @@ for SEED in "${SEEDS[@]}"; do
   CUDA_VISIBLE_DEVICES="${GPU_ID}" puffer train puffer_drive \
     --env.map-sampling-strategy prioritized \
     --env.map-score "${MAP_SCORE}" \
-    --env.map-agent-reduce "${MAP_AGENT_REDUCE}" \
-    --env.score-transform rank \
-    --env.map-replay-prob 0.5 \
-    --env.map-score-temperature 2.0 \
-    --env.map-staleness-coef 0.3 \
-    --env.map-sampler-seed "${SEED}" \
     --env.map-dir "${MAP_DIR}" \
     --env.num-maps "${NUM_MAPS}" \
     --train.seed "${SEED}" \

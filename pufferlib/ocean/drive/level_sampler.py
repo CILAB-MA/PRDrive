@@ -1,39 +1,15 @@
-"""Prioritized Level Replay (PLR) over WOMD map ids.
-
-Ports the sampling algorithm from `facebookresearch/level-replay`
-(level_replay/level_sampler.py -- Jiang et al., "Prioritized Level Replay"),
-adapted to this repo in two ways:
-
-1. "Levels" here are map ids (0..num_maps-1) rather than environment seeds.
-2. The original picks one level per parallel actor. Here, the C simulator
-   (see `pufferlib/ocean/drive/binding.c`, `my_shared()`) loads whole maps
-   until the controllable-agent budget is met. `sample_until()` walks
-   `sample_one()` and stops at the first map whose running agent count
-   (from a precomputed table) meets that budget, so the queue C receives
-   is exactly the maps it will open.
-
-MaxMC is computed in two stages. `compute_agent_max_mc` scores each agent
-on a map, `aggregate_agent_scores` collapses those scores, and the result is
-written to `scores[map_id]`. That buffer is the map score consumed by Drive.
-Other scores can still be passed in through `update()` / `update_batch()`.
-"""
 
 import numpy as np
 
 
 class LevelSampler:
-    """Tracks a score and a staleness value per map id, and samples which
-    map to try next by blending "replay high-score maps" with "make sure
-    stale/unseen maps aren't starved" -- see `sample_one` for the schedule.
-    """
-
     def __init__(
         self,
         num_maps,
         strategy="prioritized",  # "prioritized" or "uniform"
-        score_transform="power",  # "power" or "rank"
-        temperature=1.0,
-        staleness_coef=0.1,
+        score_transform="rank",  # "rank" or "power". Rank is required for negative MaxMC scores.
+        temperature=2.0,  # beta: rank/power temperature
+        staleness_coef=0.3,  # mix weight on staleness vs score
         staleness_transform="power",
         staleness_temperature=1.0,
         rho=0.2,  # fraction of maps that must be seen before replay can start
@@ -41,7 +17,9 @@ class LevelSampler:
         alpha=1.0,  # score EMA rate: new = (1 - alpha) * old + alpha * latest
         eps=1e-3,  # power-transform smoothing so a never-updated score isn't exactly 0
         seed=None,
-        agent_aggregate="mean",  # how per-agent MaxMC scores collapse to one map score
+        agent_aggregate="mean",  # how per-agent scores collapse to one map score
+        gae_gamma=0.99,  # discount used when PVL builds GAE from a stored rollout
+        gae_lambda=0.95,  # GAE lambda used when PVL builds advantages from a stored rollout
     ):
         if strategy not in ("prioritized", "uniform", "sequential"):
             raise ValueError(
@@ -69,13 +47,15 @@ class LevelSampler:
         self.agent_aggregate = agent_aggregate
         if self.agent_aggregate not in ("mean", "max", "min"):
             raise ValueError(f"agent_aggregate must be 'mean', 'max', or 'min', got {agent_aggregate!r}")
+        self.gae_gamma = float(gae_gamma)
+        self.gae_lambda = float(gae_lambda)
         self._rng = np.random.default_rng(seed)
 
         # Per-map state.
         self.scores = np.zeros(self.num_maps, dtype=np.float64)
         self.staleness = np.zeros(self.num_maps, dtype=np.float64)
         self.seen = np.zeros(self.num_maps, dtype=bool)
-        
+
         # Best episodic return seen on each map. Used by MaxMC (minimax compute_max_mc).
         self.max_returns = np.zeros(self.num_maps, dtype=np.float64)
         self._next_index = 0
@@ -272,6 +252,85 @@ class LevelSampler:
         self.update(map_id, reduced)
         return float(self.scores[map_id])
 
+    def score_pvl(self, map_id, advantages, dones):
+        """Score one map with Positive Value Loss and store it in ``scores[map_id]``.
+
+        advantages: (T, A) float. GAE (or any advantage) at each step for each
+            controllable agent on this map.
+        dones: (T, A) float. 1 where that agent ends an episode at that step.
+        Per-agent score is the mean of max(advantage, 0) over each episode,
+        then mean over episodes (unfinished tail counts, same as MaxMC).
+        """
+        map_id = int(map_id)
+        reduced = aggregate_agent_scores(compute_agent_pvl(advantages, dones), self.agent_aggregate)
+        self.update(map_id, reduced)
+        return float(self.scores[map_id])
+
+    def score_pvl_rollout(self, map_id, rewards, values, dones, gamma=None, gae_lambda=None):
+        """Build GAE from a stored (r, V, done) rollout, then ``score_pvl``.
+
+        Drive records those arrays the same way as MaxMC. PPO advantages are
+        not available at resample time, so GAE is computed here with
+        ``gae_gamma`` / ``gae_lambda``.
+        """
+        advantages = compute_gae(
+            rewards,
+            values,
+            dones,
+            gamma=self.gae_gamma if gamma is None else gamma,
+            gae_lambda=self.gae_lambda if gae_lambda is None else gae_lambda,
+        )
+        return self.score_pvl(map_id, advantages, dones)
+
+    def score_learnability(self, map_id, successes, dones=None):
+        """Score one map with goal-success learnability and store it in ``scores[map_id]``.
+
+        successes: (T, A) 1 on steps where that agent reached its goal, else 0.
+            An episode succeeds if it hit the goal at least once.
+        dones: (T, A) optional. 1 where that agent ends an episode.
+        The map score is p(1-p) where p is the fraction of episodes (pooled
+        across agents on this map) that reached the goal. Peaks at 0.25 when
+        half the episodes succeed.
+        """
+        map_id = int(map_id)
+        reduced = compute_learnability(successes, dones)
+        self.update(map_id, reduced)
+        return float(self.scores[map_id])
+
+    def score(self, map_id, score_function, rewards=None, values=None, dones=None, advantages=None, successes=None):
+        """Dispatch to MaxMC, PVL, or learnability and write ``scores[map_id]``.
+
+        Mirrors Kinetix ``compute_score``. ``advantages`` is optional for PVL;
+        if omitted, GAE is built from ``rewards`` / ``values`` / ``dones``.
+        Learnability uses ``successes`` (goal reached) and ``dones``.
+        """
+        name = _normalize_score_function(score_function)
+        if name == "max_mc":
+            if self.score_transform != "rank":
+                raise ValueError(
+                    "MaxMC scores can be negative, so score_transform must be 'rank'. "
+                    f"Got: {self.score_transform!r}"
+                )
+            return self.score_max_mc(map_id, rewards, values, dones)
+        if name == "pvl":
+            if advantages is None:
+                return self.score_pvl_rollout(map_id, rewards, values, dones)
+            return self.score_pvl(map_id, advantages, dones)
+        if name == "learnability":
+            return self.score_learnability(map_id, successes, dones)
+        raise ValueError(f"Unknown score function: {score_function!r}")
+
+
+def _normalize_score_function(score_function):
+    name = str(score_function).strip().lower().replace("-", "_")
+    if name in ("maxmc", "max_mc"):
+        return "max_mc"
+    if name in ("pvl", "positive_value_loss"):
+        return "pvl"
+    if name in ("return", "learnability"):
+        return name
+    return name
+
 
 def aggregate_agent_scores(agent_scores, agent_aggregate="mean"):
     """Collapse one score per agent into the score for their map."""
@@ -341,3 +400,157 @@ def compute_max_mc(rewards, values, dones, max_return, agent_aggregate="mean"):
     """
     agent_scores, level_max = compute_agent_max_mc(rewards, values, dones, max_return)
     return aggregate_agent_scores(agent_scores, agent_aggregate), level_max
+
+
+def compute_gae(rewards, values, dones, gamma=0.99, gae_lambda=0.95):
+    """GAE(lambda) over a stored rollout. Same layout as MaxMC: (T, A) or (T,).
+
+    values[t] is V(s_t) and rewards[t] is r_t, matching Drive's MaxMC buffers.
+    The last step has no V(s_{t+1}); if that step is not done, V(s_t) is used
+    as the bootstrap (same truncation heuristic as pufferl). Done steps cut
+    the backup.
+    """
+    rewards = np.asarray(rewards, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
+    dones = np.asarray(dones, dtype=np.float64)
+    squeeze = rewards.ndim == 1
+    if squeeze:
+        rewards = rewards[:, None]
+        values = values[:, None]
+        dones = dones[:, None]
+    if rewards.shape != values.shape or rewards.shape != dones.shape:
+        raise ValueError("rewards, values, and dones must have the same shape")
+    if rewards.size == 0:
+        return np.zeros((0, 0), dtype=np.float64) if not squeeze else np.zeros(0, dtype=np.float64)
+
+    timesteps, agents = rewards.shape
+    advantages = np.zeros((timesteps, agents), dtype=np.float64)
+    lastgaelam = np.zeros(agents, dtype=np.float64)
+    gamma = float(gamma)
+    lam = float(gae_lambda)
+    for t in range(timesteps - 1, -1, -1):
+        nonterminal = 1.0 - (dones[t] > 0).astype(np.float64)
+        next_v = values[t + 1] if t + 1 < timesteps else values[t]
+        delta = rewards[t] + gamma * next_v * nonterminal - values[t]
+        lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
+        advantages[t] = lastgaelam
+    if squeeze:
+        return advantages[:, 0]
+    return advantages
+
+
+def compute_agent_pvl(advantages, dones):
+    """Per-agent Positive Value Loss. Returns (A,) mean of max(A_t, 0) per episode."""
+    advantages = np.asarray(advantages, dtype=np.float64)
+    dones = np.asarray(dones, dtype=np.float64)
+    if advantages.ndim == 1:
+        advantages = advantages[:, None]
+        dones = dones[:, None]
+    if advantages.shape != dones.shape:
+        raise ValueError("advantages and dones must have the same shape")
+    if advantages.size == 0:
+        return np.zeros(0, dtype=np.float64)
+
+    pos = np.maximum(advantages, 0.0)
+    timesteps, agents = pos.shape
+    partial_sum = np.zeros(agents, dtype=np.float64)
+    partial_steps = np.zeros(agents, dtype=np.float64)
+    sum_ep = np.zeros(agents, dtype=np.float64)
+    n_episodes = np.zeros(agents, dtype=np.float64)
+    for t in range(timesteps):
+        partial_sum += pos[t]
+        partial_steps += 1.0
+        done = dones[t] > 0
+        sum_ep += np.where(done, partial_sum / partial_steps, 0.0)
+        n_episodes += done
+        partial_sum = np.where(done, 0.0, partial_sum)
+        partial_steps = np.where(done, 0.0, partial_steps)
+    open_tail = partial_steps > 0
+    tail = np.divide(partial_sum, partial_steps, out=np.zeros_like(partial_sum), where=open_tail)
+    sum_ep = np.where(open_tail, sum_ep + tail, sum_ep)
+    n_episodes = np.where(open_tail, n_episodes + 1.0, n_episodes)
+    n_episodes = np.maximum(n_episodes, 1.0)
+    return sum_ep / n_episodes
+
+
+def compute_pvl(advantages, dones, agent_aggregate="mean"):
+    """Agent PVL scores reduced to one map score."""
+    return aggregate_agent_scores(compute_agent_pvl(advantages, dones), agent_aggregate)
+
+
+def compute_learnability(successes, dones=None):
+    """Map learnability p(1-p) from binary goal success.
+
+    successes: (T, A) flag that the agent reached its goal at that step, or a
+        1d array of already-finished episode outcomes.
+    dones: (T, A) optional episode ends. An episode succeeds if it saw a goal
+        hit at least once. Unfinished tails count, same as MaxMC.
+    Episodes are pooled across agents on the map. Per-agent p_i(1-p_i) would
+        collapse to 0 whenever each agent only finishes one episode.
+    """
+    successes = np.asarray(successes, dtype=np.float64)
+    if successes.size == 0:
+        return 0.0
+    if dones is None:
+        outcomes = (successes.reshape(-1) > 0).astype(np.float64)
+        p = float(outcomes.mean())
+        return p * (1.0 - p)
+
+    dones = np.asarray(dones, dtype=np.float64)
+    if successes.ndim == 1:
+        successes = successes[:, None]
+        dones = dones[:, None]
+    if successes.shape != dones.shape:
+        raise ValueError("successes and dones must have the same shape")
+
+    timesteps, agents = successes.shape
+    partial_hit = np.zeros(agents, dtype=np.float64)
+    partial_steps = np.zeros(agents, dtype=np.float64)
+    n_success = 0.0
+    n_episodes = 0.0
+    for t in range(timesteps):
+        partial_hit = np.maximum(partial_hit, (successes[t] > 0).astype(np.float64))
+        partial_steps += 1.0
+        done = dones[t] > 0
+        n_success += float(np.where(done, partial_hit, 0.0).sum())
+        n_episodes += float(done.sum())
+        partial_hit = np.where(done, 0.0, partial_hit)
+        partial_steps = np.where(done, 0.0, partial_steps)
+    open_tail = partial_steps > 0
+    n_success += float(np.where(open_tail, partial_hit, 0.0).sum())
+    n_episodes += float(open_tail.sum())
+    n_episodes = max(n_episodes, 1.0)
+    p = n_success / n_episodes
+    return float(p * (1.0 - p))
+
+
+def compute_score(
+    score_function,
+    *,
+    dones,
+    values=None,
+    max_return=0.0,
+    rewards=None,
+    advantages=None,
+    successes=None,
+    agent_aggregate="mean",
+    gamma=0.99,
+    gae_lambda=0.95,
+):
+    """Pick MaxMC, PVL, or learnability. Returns (map_score, extra) where extra
+    is the updated max return for MaxMC and NaN otherwise.
+
+    Mirrors Kinetix ``compute_score``. PVL uses ``advantages`` when given,
+    otherwise GAE from ``rewards`` / ``values`` / ``dones``. Learnability uses
+    ``successes`` (goal reached) and ``dones``.
+    """
+    name = _normalize_score_function(score_function)
+    if name == "max_mc":
+        return compute_max_mc(rewards, values, dones, max_return, agent_aggregate)
+    if name == "pvl":
+        if advantages is None:
+            advantages = compute_gae(rewards, values, dones, gamma, gae_lambda)
+        return compute_pvl(advantages, dones, agent_aggregate), float("nan")
+    if name == "learnability":
+        return compute_learnability(successes, dones), float("nan")
+    raise ValueError(f"Unknown score function: {score_function!r}")
