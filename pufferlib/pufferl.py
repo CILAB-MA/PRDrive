@@ -260,9 +260,8 @@ class PuffeRL:
         return (self.global_step - self.last_log_step) / (time.time() - self.last_log_time)
 
     def _publish_plr_values(self, value):
-        """Hand V(s) to the env so MaxMC can score the map on the next step."""
         driver = getattr(self.vecenv, "driver_env", None)
-        if driver is None or getattr(driver, "map_score", None) != "max_mc":
+        if driver is None or getattr(driver, "map_score", None) not in ("max_mc", "pvl"):
             return
         if getattr(driver, "level_sampler", None) is None:
             return
