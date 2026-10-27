@@ -90,6 +90,7 @@ class Drive(pufferlib.PufferEnv):
         map_sampling_strategy="uniform",  # "uniform", "prioritized", or "sequential"
         map_score="return",  # "return", "max_mc", "pvl", or "learnability"
         eval_map_log_path=None,  # eval only: save per-map logs (see _dump_map_logs)
+        map_id_queue=None,  # optional explicit map ids for eval; C still stops at the agent budget
     ):
         # env
         self.dt = dt
@@ -97,6 +98,9 @@ class Drive(pufferlib.PufferEnv):
         self.num_maps = num_maps
         self.report_interval = report_interval
         self.eval_map_log_path = eval_map_log_path
+        self._explicit_map_id_queue = (
+            None if map_id_queue is None else np.ascontiguousarray(map_id_queue, dtype=np.int32)
+        )
 
         # Which map gets loaded next: "uniform" leaves it to C's rand() (unchanged
         # default behavior); "prioritized" hands C a PLR-ordered candidate queue
@@ -392,6 +396,8 @@ class Drive(pufferlib.PufferEnv):
         return np.asarray(counts[:num_maps], dtype=np.int32)
 
     def _build_map_id_queue(self, batch_size):
+        if self._explicit_map_id_queue is not None:
+            return self._explicit_map_id_queue, {}
         if self.level_sampler is None:
             return None, {}
         map_id_queue, metrics = self.level_sampler.sample_until(self.controllable_counts, batch_size)
