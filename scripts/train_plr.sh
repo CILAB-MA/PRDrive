@@ -6,8 +6,11 @@
 # from controllable_counts.npy next to the training bins.
 #
 # Usage:
-#   ./scripts/train_plr.sh 0 plr_10k
-#   ./scripts/train_plr.sh 1 plr_10k
+#   ./scripts/train_plr.sh 0 maxmc_10k
+#   MAP_SCORE=learnability ./scripts/train_plr.sh 1 learn_10k
+#   MAP_SCORE=pvl ./scripts/train_plr.sh 0 pvl_10k
+#
+# wandb group follows MAP_SCORE: max_mc → maxmc, learnability → learn.
 #
 # Args:
 #   $1  GPU id
@@ -43,6 +46,11 @@ SEEDS=(11 3 42)
 TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-2000000000}"
 NUM_MAPS="${NUM_MAPS:-10000}"
 MAP_SCORE="${MAP_SCORE:-max_mc}"
+case "${MAP_SCORE}" in
+  max_mc) SCORE_GROUP="maxmc" ;;
+  learnability) SCORE_GROUP="learn" ;;
+  *) SCORE_GROUP="${MAP_SCORE}" ;;
+esac
 
 if [[ ! -f "${COUNTS}" ]]; then
   echo "missing ${COUNTS}" >&2
@@ -51,8 +59,8 @@ fi
 
 export WANDB_ENTITY="${WANDB_ENTITY:-cilab-ma}"
 WANDB_PROJECT="${WANDB_PROJECT:-scp_drive}"
-WANDB_GROUP="${WANDB_GROUP:-plr}"
-TAG_PREFIX="${TAG_PREFIX:-plr}"
+WANDB_GROUP="${WANDB_GROUP:-${SCORE_GROUP}}"
+TAG_PREFIX="${TAG_PREFIX:-${SCORE_GROUP}}"
 
 EVAL_ARGS=()
 if [[ ! -f "${EVAL_COUNTS}" ]]; then

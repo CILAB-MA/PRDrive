@@ -43,7 +43,7 @@ ap.add_argument(
     "--max-localized-cars",
     type=int,
     default=MAX_LOCALIZED_CARS,
-    help="Complete car-fails at or below this count are localized_failure; above is globally_difficult",
+    help="Complete car-fails at or below this count are localized_failure; above is globally_difficult. return<0 is many_fail first.",
 )
 ap.add_argument("--min-n", type=float, default=1, help="Ignore maps with fewer cars (summed over reads) than this")
 a = ap.parse_args()
@@ -135,6 +135,7 @@ colors = {
     "solved": "tab:green",
     "localized_failure": "tab:orange",
     "globally_difficult": "tab:cyan",
+    "many_fail": "tab:red",
 }
 fig, ax = plt.subplots(1, 3, figsize=(17, 4.8))
 for c in order:

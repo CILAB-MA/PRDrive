@@ -14,6 +14,20 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pufferlib.ocean.benchmark.structure import classify_structure, failed_cars
 
 MARKER_SIZE = 36.0
+CATEGORY_STYLE = {
+    "localized_failure": {
+        "color": "#ff7f0e",
+        "label": "localized failure\nexactly 1 complete-fail car",
+    },
+    "globally_difficult": {
+        "color": "#17becf",
+        "label": "globally difficult\n2+ complete-fail cars",
+    },
+    "many_fail": {
+        "color": "#d62728",
+        "label": "many-fail\nreturn < 0 (more hits than cars)",
+    },
+}
 
 
 def load_seed_rows(result_dir):
@@ -63,8 +77,8 @@ def write_failure_scatter(raw, out_dir, exp_name, mode="self_play"):
     n_max = float(fail["agents_per_map"].max())
     xlim = (min(-3.8, float(fail["episode_return"].min()) - 0.1), 1.08)
 
-    fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.8), dpi=140)
-    fig.subplots_adjust(wspace=0.36, top=0.80, bottom=0.16, left=0.07, right=0.97)
+    fig, axes = plt.subplots(1, 3, figsize=(16.4, 4.8), dpi=140)
+    fig.subplots_adjust(wspace=0.32, top=0.80, bottom=0.16, left=0.05, right=0.98)
 
     sc_left = axes[0].scatter(
         fail["episode_return"],
@@ -83,7 +97,27 @@ def write_failure_scatter(raw, out_dir, exp_name, mode="self_play"):
     cbar_left = fig.colorbar(sc_left, ax=axes[0], pad=0.02)
     cbar_left.set_label("hits on the worst agent")
 
-    sc_right = axes[1].scatter(
+    mid = axes[1]
+    for cat, style in CATEGORY_STYLE.items():
+        part = fail[fail["category"] == cat]
+        if part.empty:
+            continue
+        mid.scatter(
+            part["episode_return"],
+            part["fail_rate"],
+            c=style["color"],
+            s=MARKER_SIZE,
+            alpha=0.78,
+            linewidths=0,
+            zorder=3,
+            label=style["label"],
+        )
+    mid.set_ylabel("failed agents / agents per map")
+    mid.set_title("Label: 1-car vs 2+ cars")
+    mid.set_ylim(bottom=0)
+    mid.legend(loc="upper left", frameon=True, fontsize=8, borderpad=0.6, handletextpad=0.5)
+
+    sc_right = axes[2].scatter(
         fail["episode_return"],
         fail["worst_agent_hits"],
         c=fail["agents_per_map"],
@@ -94,10 +128,10 @@ def write_failure_scatter(raw, out_dir, exp_name, mode="self_play"):
         linewidths=0,
         zorder=3,
     )
-    axes[1].set_ylabel("hits on the worst agent")
-    axes[1].set_title("Same local hits, diluted by n")
-    axes[1].set_ylim(0.4, hits_vmax + 0.6)
-    cbar_right = fig.colorbar(sc_right, ax=axes[1], pad=0.02)
+    axes[2].set_ylabel("hits on the worst agent")
+    axes[2].set_title("Same local hits, diluted by n")
+    axes[2].set_ylim(0.4, hits_vmax + 0.6)
+    cbar_right = fig.colorbar(sc_right, ax=axes[2], pad=0.02)
     cbar_right.set_label("# of agents per map")
 
     for ax in axes:

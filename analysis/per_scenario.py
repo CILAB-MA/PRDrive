@@ -722,6 +722,7 @@ CATEGORY_COLORS = {
     "solved": "tab:green",
     "localized_failure": "tab:orange",
     "globally_difficult": "tab:cyan",
+    "many_fail": "tab:red",
 }
 
 
@@ -787,7 +788,7 @@ def plot_results(result_dir, table=None, summary=None, logs=None):
     written = []
     fig, ax = plt.subplots(1, 3, figsize=(17, 4.8))
     _failure_panels(ax, table, summary)
-    fig.suptitle("structure: 1-car localized vs 2+ globally-difficult", fontsize=10, y=1.02)
+    fig.suptitle("structure: 1-car localized vs 2+ globally-difficult vs many-fail (return<0)", fontsize=10, y=1.02)
     fig.tight_layout()
     path = os.path.join(result_dir, "failure_distribution.png")
     fig.savefig(path, dpi=130, bbox_inches="tight")

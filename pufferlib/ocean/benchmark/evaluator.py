@@ -16,6 +16,12 @@ import pufferlib
 # WOSAC eval
 from pufferlib.ocean.benchmark import metrics
 from pufferlib.ocean.benchmark import estimators
+from pufferlib.ocean.drive.level_sampler import merge_sampler_states, score_replay_weights
+from pufferlib.ocean.benchmark.structure import (
+    STRUCTURE_CATEGORIES,
+    classify_structure,
+    failed_cars,
+)
 
 
 _METRIC_FIELD_NAMES = [
@@ -806,12 +812,255 @@ class WOSACEvaluator:
             plt.savefig(f"trajectory_comparison_agent_{agent_idx}.png")
 
 
+LENS_SPECS = {
+    "success": {"rate_key": "score", "invert": False},
+    "failure": {"rate_key": "collision_rate", "invert": True},
+    "return": {"rate_key": "episode_return", "invert": False},
+}
+
+def load_controllable_counts(map_dir, num_maps):
+    path = os.path.join(str(map_dir), "controllable_counts.npy")
+    if not os.path.isfile(path):
+        return None
+    counts = np.asarray(np.load(path))
+    return np.asarray(counts[: min(int(num_maps), len(counts))], dtype=np.int32)
+
+
+def pack_maps_from(counts, start, budget, num_maps):
+    num_maps = int(num_maps)
+    if num_maps < 1:
+        raise ValueError("num_maps must be >= 1")
+    budget = max(int(budget), 1)
+    start = int(start) % num_maps
+    counts = None if counts is None else np.asarray(counts)
+    chosen = []
+    total = 0
+    idx = start
+    for _ in range(num_maps):
+        map_id = idx % num_maps
+        idx += 1
+        n = 1
+        if counts is not None and map_id < len(counts):
+            n = int(counts[map_id])
+        if n <= 0:
+            continue
+        chosen.append(map_id)
+        total += n
+        if total >= budget:
+            break
+    if not chosen:
+        chosen = [start]
+        total = 1
+        idx = start + 1
+    return np.asarray(chosen, dtype=np.int32), int(idx % num_maps), int(total)
+
+
+def structure_scalars(logs, prefix="analyze/structure"):
+    populated = [
+        log
+        for log in logs or []
+        if log and float(log.get("n", 0) or 0) > 0 and "score" in log and "_plr_scores" not in log
+    ]
+    map_categories = {}
+    rows = []
+    for log in populated:
+        cat = classify_structure(log)
+        n = float(log["n"])
+        failed = failed_cars(log)
+        score = float(log["score"])
+        ep_ret = float(log["episode_return"]) if "episode_return" in log else None
+        map_id = int(log["map_id"]) if "map_id" in log else -1
+        rows.append((cat, n, failed, score, ep_ret, map_id))
+        if map_id >= 0:
+            map_categories[map_id] = cat
+
+    stats = {f"{prefix}/{cat}_n": 0.0 for cat in STRUCTURE_CATEGORIES}
+    if not rows:
+        return stats, map_categories
+
+    total_n = sum(row[1] for row in rows)
+    total_failed = sum(row[2] for row in rows)
+    n_scen = float(len(rows))
+    stats[f"{prefix}/maps"] = n_scen
+    stats[f"{prefix}/failed_cars"] = float(total_failed)
+    stats[f"{prefix}/mean_score"] = float(sum(row[3] * row[1] for row in rows) / total_n) if total_n else 0.0
+    rets = [(row[4], row[1]) for row in rows if row[4] is not None]
+    if rets:
+        stats[f"{prefix}/mean_return"] = float(sum(r * n for r, n in rets) / sum(n for _, n in rets))
+
+    for cat in STRUCTURE_CATEGORIES:
+        part = [row for row in rows if row[0] == cat]
+        stats[f"{prefix}/{cat}_n"] = float(len(part))
+        stats[f"{prefix}/{cat}_share"] = float(len(part) / n_scen)
+        failed = sum(row[2] for row in part)
+        stats[f"{prefix}/{cat}_failed_cars"] = float(failed)
+        stats[f"{prefix}/{cat}_failed_share"] = float(failed / total_failed) if total_failed > 0 else 0.0
+        if not part:
+            continue
+        pn = sum(row[1] for row in part)
+        stats[f"{prefix}/{cat}_mean_score"] = float(sum(row[3] * row[1] for row in part) / pn) if pn else 0.0
+        stats[f"{prefix}/{cat}_mean_n"] = float(pn / len(part))
+        stats[f"{prefix}/{cat}_mean_failed"] = float(sum(row[2] for row in part) / len(part))
+        part_rets = [(row[4], row[1]) for row in part if row[4] is not None]
+        if part_rets:
+            stats[f"{prefix}/{cat}_mean_return"] = float(
+                sum(r * n for r, n in part_rets) / sum(n for _, n in part_rets)
+            )
+    return stats, map_categories
+
+
+def analyze_scalars(logs, plr_state=None, prefix="analyze"):
+    """Structure split plus window means, keyed for wandb ``analyze/`` panels."""
+    populated = [
+        log
+        for log in logs or []
+        if log and float(log.get("n", 0) or 0) > 0 and "score" in log and "_plr_scores" not in log
+    ]
+    stats = {f"{prefix}/maps": float(len(populated))}
+    struct_stats, map_categories = structure_scalars(populated, prefix=f"{prefix}/structure")
+    stats.update(struct_stats)
+    for lens, spec in LENS_SPECS.items():
+        key = spec["rate_key"]
+        rates, ns = [], []
+        for log in populated:
+            if key not in log:
+                continue
+            value = float(log[key])
+            rates.append((1.0 - value) if spec["invert"] else value)
+            ns.append(float(log["n"]))
+        if ns:
+            nsum = float(sum(ns))
+            stats[f"{prefix}/{lens}/rate"] = float(sum(r * n for r, n in zip(rates, ns)) / nsum)
+    if plr_state is None or not map_categories:
+        return stats
+    scores, seen = plr_state
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    seen = np.asarray(seen, dtype=bool).reshape(-1)
+    ids = np.fromiter(map_categories.keys(), dtype=np.int64)
+    ids = ids[(ids >= 0) & (ids < scores.shape[0])]
+    if ids.size == 0:
+        return stats
+    struct = f"{prefix}/structure"
+    cats = np.array([map_categories[int(i)] for i in ids])
+    window_seen = seen[ids]
+    stats[f"{struct}/plr_seen_frac"] = float(window_seen.mean())
+    weights = score_replay_weights(scores, seen)
+    denom_ids = ids[window_seen]
+    denom = float(weights[denom_ids].sum()) if denom_ids.size else 0.0
+    for cat in STRUCTURE_CATEGORIES:
+        mask = (cats == cat) & window_seen
+        stats[f"{struct}/plr_mean_{cat}"] = float(scores[ids[mask]].mean()) if mask.any() else 0.0
+        stats[f"{struct}/plr_weight_{cat}"] = (
+            float(weights[ids[mask]].sum() / denom) if denom > 0 and mask.any() else 0.0
+        )
+    return stats
+
+
+def score_tail_map_ids(plr_state, k, map_dir, num_maps, tail=None, map_score="max_mc"):
+    """Live hard-k training maps from the current sampler state.
+
+    Defaults to the hard end of the stored score: high MaxMC/PVL/learnability,
+    low episode-return. Rank transform is not applied. Falls back to file-order
+    maps if nothing has been seen yet.
+    """
+    k = int(k) if k is not None else 200
+    num_maps = int(num_maps)
+    counts = load_controllable_counts(map_dir, num_maps)
+    if tail is None:
+        name = str(map_score or "max_mc").lower().replace("-", "_")
+        tail = "low" if name in ("return", "episode_return") else "high"
+    if plr_state is not None:
+        scores, seen = plr_state
+        scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+        seen = np.asarray(seen, dtype=bool).reshape(-1)
+        ids = np.flatnonzero(seen[: min(scores.shape[0], seen.shape[0])])
+        if counts is not None:
+            counts = np.asarray(counts)
+            ids = ids[ids < len(counts)]
+            ids = ids[np.asarray(counts[ids]) > 0]
+        if ids.size:
+            k = min(max(k, 1), int(ids.size))
+            order = np.argsort(scores[ids], kind="mergesort")
+            picked = ids[order[-k:] if tail == "high" else order[:k]]
+            return np.asarray(picked, dtype=np.int32)
+    chosen = []
+    for map_id in range(max(num_maps, 1)):
+        n = 1 if counts is None or map_id >= len(counts) else int(counts[map_id])
+        if n <= 0:
+            continue
+        chosen.append(map_id)
+        if len(chosen) >= max(k, 1):
+            break
+    return np.asarray(chosen or [0], dtype=np.int32)
+
+
+def tail_rank_scalars(map_ids, plr_state=None, prefix="analyze/lowk"):
+    """PLR rank stats for the maps that were actually rolled this eval."""
+    map_ids = np.asarray([] if map_ids is None else map_ids, dtype=np.int64)
+    stats = {f"{prefix}/k": float(map_ids.size)}
+    if plr_state is None or map_ids.size == 0:
+        return stats
+    scores, seen = plr_state
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    seen = np.asarray(seen, dtype=bool).reshape(-1)
+    stats[f"{prefix}/seen_n"] = float(seen.sum())
+    in_range = (map_ids >= 0) & (map_ids < scores.shape[0])
+    ids = map_ids[in_range]
+    if ids.size == 0:
+        return stats
+    selected = scores[ids]
+    stats[f"{prefix}/plr_mean"] = float(selected.mean())
+    stats[f"{prefix}/plr_min"] = float(selected.min())
+    stats[f"{prefix}/plr_max"] = float(selected.max())
+    return stats
+
+
+def agents_for_map_ids(map_dir, map_ids, num_maps):
+    map_ids = np.asarray(map_ids, dtype=np.int32)
+    if map_ids.size == 0:
+        return 1
+    counts = load_controllable_counts(map_dir, num_maps)
+    if counts is None:
+        return max(int(map_ids.size), 1)
+    total = 0
+    for map_id in map_ids:
+        if 0 <= int(map_id) < len(counts):
+            total += max(int(counts[int(map_id)]), 1)
+        else:
+            total += 1
+    return max(total, 1)
+
+
+def collect_train_plr_state(vecenv, worker_states=None):
+    if worker_states:
+        merged = merge_sampler_states(worker_states.values())
+        if merged is not None:
+            return merged
+    samplers = []
+    envs = getattr(vecenv, "envs", None)
+    if envs:
+        samplers = [env.level_sampler for env in envs if getattr(env, "level_sampler", None) is not None]
+    elif not hasattr(vecenv, "processes"):
+        driver = getattr(vecenv, "driver_env", None)
+        sampler = getattr(driver, "level_sampler", None)
+        if sampler is not None:
+            samplers = [sampler]
+    if not samplers:
+        return None
+    return merge_sampler_states([(s.scores, s.seen) for s in samplers])
+
+
 class Evaluator:
     """Evaluates policies in self_play or human_replay mode, with optional rendering.
 
     Initializes the eval envs needed based on eval config flags:
     - human_replay_eval: creates sp_env + hr_env
     - render_eval: creates sp_env (if not already created)
+
+    Self-play eval rolls the current hard-k training maps by the live PLR
+    score (high MaxMC/PVL/learnability; k matches human-replay's 200
+    validation maps) and labels them by failure structure. Human-replay
+    eval stays on ``eval.map_dir``.
     """
 
     RENDER_FIRST = "first"
@@ -819,7 +1068,7 @@ class Evaluator:
     RENDER_WORST_SCORE = "worst_score"
     RENDER_WORST_COLLISION = "worst_collision"
 
-    def __init__(self, configs, logger=None):
+    def __init__(self, configs, logger=None, map_id_queue=None):
         self.configs = configs
         self.logger = logger
         self.sim_steps = 90
@@ -830,6 +1079,10 @@ class Evaluator:
         self.render_env_idx = 0  # Which of the vecenvs to use for rendering
         self.inference_lambda_values = [0.0, 0.01, 0.05, 0.2]
         self.lambda_sweep_results = {}  # {lambda_val: collision_rate}
+        self.train_sp_queue = None
+        self.train_num_maps = int(configs["env"]["num_maps"])
+        self.train_map_dir = configs["env"]["map_dir"]
+        self.map_id_queue = None if map_id_queue is None else np.asarray(map_id_queue, dtype=np.int32)
 
         self._unpack_eval_configs(configs)
 
@@ -849,12 +1102,26 @@ class Evaluator:
         eval_config["env"]["lambda_value"] = configs["env"]["lambda_value"]
         eval_config["env"]["obs_partner_noise_speed"] = 0.0
         eval_config["env"]["obs_partner_noise_pos"] = 0.0
+        eval_config["env"]["map_sampling_strategy"] = "uniform"
 
         self.hr_eval_config = copy.deepcopy(eval_config)
         self.hr_eval_config["env"]["control_mode"] = "control_sdc_only"
         self.hr_eval_config["env"]["goal_behavior"] = 0  # Remove and terminate at goal
         self.sp_eval_config = copy.deepcopy(eval_config)
         self.sp_eval_config["env"]["control_mode"] = "control_agents"
+        # SP eval uses the training pool. HR stays on val.
+        self.sp_eval_config["env"]["map_dir"] = self.train_map_dir
+        self.sp_eval_config["env"]["num_maps"] = self.train_num_maps
+        k = int(self.configs["eval"].get("score_tail_k", 200))
+        if self.map_id_queue is not None and len(self.map_id_queue) > 0:
+            queue = np.ascontiguousarray(self.map_id_queue, dtype=np.int32)
+        else:
+            queue = score_tail_map_ids(None, k, self.train_map_dir, self.train_num_maps)
+        n_agents = agents_for_map_ids(self.train_map_dir, queue, self.train_num_maps)
+        self.sp_eval_config["env"]["map_id_queue"] = queue
+        self.sp_eval_config["env"]["num_agents"] = int(n_agents)
+        self.train_sp_queue = queue
+        self.train_sp_queue_agents = n_agents
         self.render_select_mode = self.configs["eval"]["render_select_mode"]
         self.render_sp_rollout = self.configs["eval"]["render_self_play_eval"]
         self.render_hr_rollout = self.configs["eval"]["render_human_replay_eval"]
@@ -916,12 +1183,27 @@ class Evaluator:
             view_mode=view_mode,
         )
 
+        env_statistics = self._attach_map_ids(driver, env_statistics)
+
         if mode == "self_play":
             self.self_play_stats = env_statistics
-            self.self_play_stats[0]["render_env_idx"] = render_env_idx
+            if self.self_play_stats and self.self_play_stats[0]:
+                self.self_play_stats[0]["render_env_idx"] = render_env_idx
         elif mode == "human_replay":
             self.human_replay_stats = env_statistics
-            self.human_replay_stats[0]["render_env_idx"] = render_env_idx
+            if self.human_replay_stats and self.human_replay_stats[0]:
+                self.human_replay_stats[0]["render_env_idx"] = render_env_idx
+
+    def _attach_map_ids(self, driver, logs):
+        if not logs:
+            return logs
+        map_ids = getattr(driver, "map_ids", None)
+        for i, log in enumerate(logs):
+            if not log:
+                continue
+            if map_ids is not None and i < len(map_ids):
+                log["map_id"] = int(map_ids[i])
+        return logs
 
     def _run_rollout(self, policy, env, mode, render_env_idx=None, per_env_logs=False, view_mode=None):
         """Run a single rollout. If render_env_idx is not None, render that env."""
@@ -1106,7 +1388,7 @@ class Evaluator:
         for p in video_files:
             os.remove(p)
 
-    def collect_stats(self):
+    def collect_stats(self, plr_state=None):
         stats = {}
 
         if self.human_replay_stats is not None:
@@ -1127,5 +1409,7 @@ class Evaluator:
                 stats["eval/sp_mean_did_collide"] = float(np.mean(did_collide))
                 stats["eval/sp_score"] = float(np.mean([log["score"] for log in populated]))
                 stats["eval/sp_num_agents"] = float(np.mean([log["n"] for log in populated]))
+            stats.update(tail_rank_scalars(self.train_sp_queue, plr_state=plr_state))
+            stats.update(analyze_scalars(self.self_play_stats, plr_state=plr_state))
 
         return stats

@@ -585,8 +585,22 @@ class Drive(pufferlib.PufferEnv):
             if self.tick > 0 and self.resample_frequency > 0 and self.tick % self.resample_frequency == 0:
                 # Resample batch of scenes used for training
                 self.resample_maps()
+                snapshot = self._plr_worker_snapshot()
+                if snapshot is not None:
+                    info.append(snapshot)
 
         return (self.observations, self.rewards, self.terminals, self.truncations, info)
+
+    def _plr_worker_snapshot(self):
+        """Full sampler state for the trainer to merge across Multiprocessing workers."""
+        sampler = getattr(self, "level_sampler", None)
+        if sampler is None or not sampler.seen.any():
+            return None
+        return {
+            "_plr_worker": int(os.getpid()),
+            "_plr_scores": np.asarray(sampler.scores, dtype=np.float64).copy(),
+            "_plr_seen": np.asarray(sampler.seen, dtype=bool).copy(),
+        }
 
     def get_global_agent_state(self):
         """Get current global state of all active agents.

@@ -32,7 +32,7 @@ def parse_args():
         "--max-localized-cars",
         type=int,
         default=MAX_LOCALIZED_CARS,
-        help="Complete car-fails at or below this count are localized_failure; above is globally_difficult",
+        help="Complete car-fails at or below this count are localized_failure; above is globally_difficult. return<0 is many_fail first.",
     )
     parser.add_argument("--plot", action="store_true", help="Write PNG figures next to the CSVs")
     parser.add_argument(
