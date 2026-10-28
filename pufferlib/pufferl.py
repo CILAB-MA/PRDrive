@@ -36,7 +36,11 @@ import pufferlib.vector
 import pufferlib.pytorch
 import pufferlib.utils
 
-from pufferlib.ocean.benchmark.evaluator import Evaluator
+from pufferlib.ocean.benchmark.evaluator import (
+    Evaluator,
+    collect_train_plr_state,
+    score_tail_map_ids,
+)
 
 try:
     from pufferlib import _C
@@ -232,6 +236,7 @@ class PuffeRL:
         self.last_stats = defaultdict(list)
         self.losses = {}
         self.data = {}
+        self._plr_worker_states = {}
 
         # We only do this for the driver env to save memory
         self.reg_mode = full_args["env"]["reg_mode"]
@@ -266,6 +271,16 @@ class PuffeRL:
         if getattr(driver, "level_sampler", None) is None:
             return
         self.vecenv.pending_plr_values = value.detach().float().reshape(-1).cpu().numpy()
+
+    def _ingest_plr_info(self, info):
+        if not isinstance(info, dict) or "_plr_scores" not in info:
+            return False
+        pid = int(info.get("_plr_worker", 0))
+        self._plr_worker_states[pid] = (
+            np.asarray(info["_plr_scores"], dtype=np.float64),
+            np.asarray(info["_plr_seen"], dtype=bool),
+        )
+        return True
 
     def evaluate(self):
         profile = self.profile
@@ -375,6 +390,8 @@ class PuffeRL:
 
             profile("eval_misc", epoch)
             for i in info:
+                if self._ingest_plr_info(i):
+                    continue
                 for k, v in pufferlib.unroll_nested_dict(i):
                     if isinstance(v, np.ndarray):
                         v = v.tolist()
@@ -682,8 +699,21 @@ class PuffeRL:
         if self.epoch % self.config["eval"]["eval_interval"] == 0 or done_training:
             human_replay_eval = self.config["eval"]["human_replay_eval"]
             self_play_eval = self.config["eval"]["self_play_eval"]
+            plr_state = collect_train_plr_state(self.vecenv, self._plr_worker_states)
+            score_tail_ids = None
+            if self_play_eval:
+                eval_cfg = self.full_args.get("eval", {})
+                k = int(eval_cfg.get("score_tail_k", 200))
+                env_cfg = self.full_args.get("env", {})
+                score_tail_ids = score_tail_map_ids(
+                    plr_state,
+                    k=k,
+                    map_dir=env_cfg["map_dir"],
+                    num_maps=int(env_cfg["num_maps"]),
+                    map_score=env_cfg.get("map_score", "max_mc"),
+                )
 
-            self.evaluator = Evaluator(self.full_args, self.logger)
+            self.evaluator = Evaluator(self.full_args, self.logger, map_id_queue=score_tail_ids)
 
             if human_replay_eval:
                 self.evaluator.hr_env = load_env("puffer_drive", self.evaluator.hr_eval_config)
@@ -705,9 +735,8 @@ class PuffeRL:
                 self.evaluator.sp_env.close()
                 self.evaluator.log_videos(eval_mode="self_play", epoch=self.epoch)
 
-            # Get statistics
             if human_replay_eval or self_play_eval:
-                eval_statistics = self.evaluator.collect_stats()
+                eval_statistics = self.evaluator.collect_stats(plr_state=plr_state)
                 self.eval_stats.update(eval_statistics)
                 del self.evaluator
 

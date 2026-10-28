@@ -6,8 +6,11 @@
 # from controllable_counts.npy next to the training bins.
 #
 # Usage:
-#   ./scripts/train_plr.sh 0 plr_10k
-#   ./scripts/train_plr.sh 1 plr_10k
+#   ./scripts/train_plr.sh 0 maxmc_10k
+#   MAP_SCORE=learnability ./scripts/train_plr.sh 1 learn_10k
+#   MAP_SCORE=pvl ./scripts/train_plr.sh 0 pvl_10k
+#
+# wandb group follows MAP_SCORE: max_mc → maxmc, learnability → learn.
 #
 # Args:
 #   $1  GPU id
@@ -43,6 +46,11 @@ SEEDS=(11 3 42)
 TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-2000000000}"
 NUM_MAPS="${NUM_MAPS:-10000}"
 MAP_SCORE="${MAP_SCORE:-max_mc}"
+case "${MAP_SCORE}" in
+  max_mc) SCORE_GROUP="maxmc" ;;
+  learnability) SCORE_GROUP="learn" ;;
+  *) SCORE_GROUP="${MAP_SCORE}" ;;
+esac
 
 if [[ ! -f "${COUNTS}" ]]; then
   echo "missing ${COUNTS}" >&2
@@ -51,13 +59,15 @@ fi
 
 export WANDB_ENTITY="${WANDB_ENTITY:-cilab-ma}"
 WANDB_PROJECT="${WANDB_PROJECT:-scp_drive}"
-WANDB_GROUP="${WANDB_GROUP:-plr}"
-TAG_PREFIX="${TAG_PREFIX:-plr}"
+WANDB_GROUP="${WANDB_GROUP:-${SCORE_GROUP}}"
+TAG_PREFIX="${TAG_PREFIX:-${SCORE_GROUP}}"
 
-EVAL_ARGS=()
+# SP eval always rolls 200 training maps (live PLR hard tail). HR needs
+# validation counts; skip HR only when that file is missing.
+EVAL_ARGS=(--eval.self-play-eval True --eval.score-tail-k 200)
 if [[ ! -f "${EVAL_COUNTS}" ]]; then
-  echo "no ${EVAL_COUNTS}; turning eval off for this run" >&2
-  EVAL_ARGS+=(--eval.human-replay-eval False --eval.self-play-eval False)
+  echo "no ${EVAL_COUNTS}; turning human-replay eval off (SP train-200 stays on)" >&2
+  EVAL_ARGS+=(--eval.human-replay-eval False)
 fi
 
 echo "========== puffer_drive PLR =========="
@@ -71,8 +81,9 @@ echo "  strategy=prioritized score=${MAP_SCORE}"
 echo "  seeds=${SEEDS[*]}"
 echo "  total_timesteps=${TOTAL_TIMESTEPS}"
 echo "  num_maps=${NUM_MAPS}"
-echo "  wandb entity=${WANDB_ENTITY} project=${WANDB_PROJECT} group=${WANDB_GROUP}"
-echo "======================================"
+  echo "  wandb entity=${WANDB_ENTITY} project=${WANDB_PROJECT} group=${WANDB_GROUP}"
+  echo "  sp_eval=train score_tail_k=200  hr_eval=$([[ -f "${EVAL_COUNTS}" ]] && echo on || echo off)"
+  echo "======================================"
 
 for SEED in "${SEEDS[@]}"; do
   echo ""

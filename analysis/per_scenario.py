@@ -15,6 +15,12 @@ import pandas as pd
 import torch
 
 import pufferlib
+from pufferlib.ocean.benchmark.structure import (
+    MAX_LOCALIZED_CARS,
+    STRUCTURE_CATEGORIES,
+    classify_structure,
+    majority_structure,
+)
 
 METRIC_KEYS = (
     "n",
@@ -39,7 +45,7 @@ METRIC_KEYS = (
     "delta_v_under_1mph",
 )
 
-CATEGORIES = ("solved", "localized_failure", "intermediate", "globally_difficult")
+CATEGORIES = STRUCTURE_CATEGORIES
 RATE_KEYS = tuple(k for k in METRIC_KEYS if k != "n")
 DEFAULT_TRAIN_MAP_DIR = "/data/prdrive/binaries/training_80000"
 
@@ -50,17 +56,6 @@ def _to_python(value):
     if isinstance(value, np.ndarray):
         return value.tolist()
     return value
-
-
-def classify_success(p, localized=0.8, globally=0.5, solved=0.999):
-    """Same cutoffs for success, 1-collision, and episode_return (solved scenes sit at 1.0)."""
-    if p >= solved:
-        return "solved"
-    if p >= localized:
-        return "localized_failure"
-    if p < globally:
-        return "globally_difficult"
-    return "intermediate"
 
 
 LENS_METRICS = {
@@ -329,7 +324,15 @@ def _write_scene_gif(path, frames, roads, log):
 
 class PerScenarioEvaluator:
 
-    def __init__(self, configs, logger=None, map_dir=None, num_maps=None, success="score", localized=0.8, globally=0.5):
+    def __init__(
+        self,
+        configs,
+        logger=None,
+        map_dir=None,
+        num_maps=None,
+        success="score",
+        max_localized_cars=MAX_LOCALIZED_CARS,
+    ):
         if success not in ("score", "completion"):
             raise ValueError("success must be 'score' or 'completion'")
         self.configs = configs
@@ -343,8 +346,7 @@ class PerScenarioEvaluator:
         self._num_maps_override = num_maps
         self.success = success
         self.success_col = "completion_rate" if success == "completion" else "score"
-        self.localized = float(localized)
-        self.globally = float(globally)
+        self.max_localized_cars = int(max_localized_cars)
         self._unpack_eval_configs(configs)
 
     def _unpack_eval_configs(self, configs):
@@ -630,23 +632,31 @@ class PerScenarioEvaluator:
 
         out = []
         for (mode, map_id), rows in grouped.items():
-            n_cars = float(sum(r.get("n", 0.0) for r in rows))
+            n_sum = float(sum(float(r.get("n", 0.0) or 0.0) for r in rows))
+            n_mean = n_sum / len(rows) if rows else 0.0
             scenario_id = next((str(r.get("scenario_id", "")) for r in rows if r.get("scenario_id")), "")
             agg = {
                 "mode": mode,
                 "map_id": map_id,
                 "scenario_id": scenario_id,
-                "n": n_cars,
+                "n": n_mean,
             }
             for key in RATE_KEYS:
                 weighted = [r[key] * r.get("n", 0.0) for r in rows if key in r]
-                if weighted:
-                    agg[key] = float(sum(weighted) / n_cars)
+                if weighted and n_sum:
+                    agg[key] = float(sum(weighted) / n_sum)
             success_rate = float(agg.get(self.success_col, 0.0))
             agg["success_rate"] = success_rate
-            agg["success"] = success_rate * n_cars
-            agg["failures"] = n_cars - agg["success"]
-            agg["category"] = classify_success(success_rate, localized=self.localized, globally=self.globally)
+            agg["success"] = success_rate * n_mean
+            agg["failures"] = n_mean - agg["success"]
+            agg["category"] = majority_structure(
+                classify_structure(
+                    row,
+                    max_localized_cars=self.max_localized_cars,
+                    score_key=self.success_col,
+                )
+                for row in rows
+            )
             out.append(agg)
         return pd.DataFrame(out).sort_values(["mode", "map_id"]).reset_index(drop=True)
 
@@ -705,16 +715,14 @@ class PerScenarioEvaluator:
             table=self.per_scenario_table(),
             summary=self.category_summary(),
             logs=self._populated_logs(),
-            localized=self.localized,
-            globally=self.globally,
         )
 
 
 CATEGORY_COLORS = {
     "solved": "tab:green",
     "localized_failure": "tab:orange",
-    "intermediate": "tab:gray",
-    "globally_difficult": "tab:red",
+    "globally_difficult": "tab:cyan",
+    "many_fail": "tab:red",
 }
 
 
@@ -751,7 +759,7 @@ def _failure_panels(ax, table, summary, title_prefix=""):
     ax[2].set_ylim(0, max(fail_share + [1]) * 1.15)
 
 
-def plot_results(result_dir, table=None, summary=None, logs=None, localized=0.8, globally=0.5):
+def plot_results(result_dir, table=None, summary=None, logs=None):
     """Write visualization PNGs into result_dir. Loads CSV/JSONL if data is not passed in."""
     import matplotlib
 
@@ -780,7 +788,7 @@ def plot_results(result_dir, table=None, summary=None, logs=None, localized=0.8,
     written = []
     fig, ax = plt.subplots(1, 3, figsize=(17, 4.8))
     _failure_panels(ax, table, summary)
-    fig.suptitle(f"localized>={localized:.0%}, globally<{globally:.0%}", fontsize=10, y=1.02)
+    fig.suptitle("structure: 1-car localized vs 2+ globally-difficult vs many-fail (return<0)", fontsize=10, y=1.02)
     fig.tight_layout()
     path = os.path.join(result_dir, "failure_distribution.png")
     fig.savefig(path, dpi=130, bbox_inches="tight")

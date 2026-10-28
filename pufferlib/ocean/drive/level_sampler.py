@@ -321,6 +321,41 @@ class LevelSampler:
         raise ValueError(f"Unknown score function: {score_function!r}")
 
 
+def merge_sampler_states(states):
+    states = list(states)
+    if not states:
+        return None
+    num_maps = int(np.asarray(states[0][0]).shape[0])
+    score_sum = np.zeros(num_maps, dtype=np.float64)
+    seen_count = np.zeros(num_maps, dtype=np.float64)
+    for scores, seen in states:
+        scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+        seen = np.asarray(seen, dtype=bool).reshape(-1)
+        if scores.shape[0] != num_maps or seen.shape[0] != num_maps:
+            raise ValueError("all sampler states must have the same num_maps")
+        score_sum += np.where(seen, scores, 0.0)
+        seen_count += seen.astype(np.float64)
+    merged_seen = seen_count > 0
+    merged_scores = np.zeros(num_maps, dtype=np.float64)
+    np.divide(score_sum, seen_count, out=merged_scores, where=merged_seen)
+    return merged_scores, merged_seen
+
+
+def score_replay_weights(scores, seen, score_transform="rank", temperature=2.0, eps=1e-3):
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    seen = np.asarray(seen, dtype=bool).reshape(-1)
+    sampler = LevelSampler(
+        num_maps=int(scores.shape[0]),
+        score_transform=score_transform,
+        temperature=temperature,
+        staleness_coef=0.0,
+        eps=eps,
+    )
+    sampler.scores = np.array(scores, copy=True)
+    sampler.seen = np.array(seen, copy=True)
+    return sampler._sample_weights()
+
+
 def _normalize_score_function(score_function):
     name = str(score_function).strip().lower().replace("-", "_")
     if name in ("maxmc", "max_mc"):

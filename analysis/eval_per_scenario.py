@@ -9,7 +9,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
-from per_scenario import DEFAULT_TRAIN_MAP_DIR, PerScenarioEvaluator, plot_results
+from per_scenario import DEFAULT_TRAIN_MAP_DIR, MAX_LOCALIZED_CARS, PerScenarioEvaluator, plot_results
 from pufferlib import pufferl
 
 ENV_NAME = "puffer_drive"
@@ -28,8 +28,12 @@ def parse_args():
     parser.add_argument("--result-dir", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--success", type=str, default="score", choices=["score", "completion"])
-    parser.add_argument("--localized", type=float, default=0.8)
-    parser.add_argument("--globally", type=float, default=0.5)
+    parser.add_argument(
+        "--max-localized-cars",
+        type=int,
+        default=MAX_LOCALIZED_CARS,
+        help="Complete car-fails at or below this count are localized_failure; above is globally_difficult. return<0 is many_fail first.",
+    )
     parser.add_argument("--plot", action="store_true", help="Write PNG figures next to the CSVs")
     parser.add_argument(
         "--plot-only",
@@ -117,13 +121,13 @@ def _tag_logs(logs, checkpoint, exp_name):
             log["exp_name"] = exp_name
 
 
-def _print_summary(label, evaluator, localized, globally):
+def _print_summary(label, evaluator):
     stats = evaluator.collect_stats()
     summary = evaluator.category_summary()
     print(f"\n=== {label} ===")
     for key, value in stats.items():
         print(f"  {key}: {value:.4f}" if isinstance(value, float) else f"  {key}: {value}")
-    print(f"category summary (localized>={localized:.0%}, globally<{globally:.0%}):")
+    print(f"category summary (localized <= {evaluator.max_localized_cars} failed cars):")
     if not summary.empty:
         printable = summary.copy()
         printable["share_of_scenarios"] = 100 * printable["share_of_scenarios"]
@@ -147,7 +151,7 @@ def main():
         run_three_lens(args.report_only)
         return
     if args.plot_only:
-        paths = plot_results(args.plot_only, localized=args.localized, globally=args.globally)
+        paths = plot_results(args.plot_only)
         if not paths:
             raise SystemExit(f"no plots written from {args.plot_only}")
         print(f"wrote {len(paths)} figures:")
@@ -174,8 +178,7 @@ def main():
         map_dir=args.map_dir,
         num_maps=args.num_maps,
         success=args.success,
-        localized=args.localized,
-        globally=args.globally,
+        max_localized_cars=args.max_localized_cars,
     )
 
     run_hr = args.mode in ("human_replay", "both")
@@ -217,7 +220,7 @@ def main():
 
         ckpt_dir = os.path.join(result_dir, stem)
         paths = evaluator.save(ckpt_dir)
-        _print_summary(stem, evaluator, args.localized, args.globally)
+        _print_summary(stem, evaluator)
         print(f"  wrote {paths['n_scenarios']} scenarios -> {paths['csv']}")
         if args.plot:
             _write_plots(evaluator, ckpt_dir)
@@ -231,7 +234,7 @@ def main():
     evaluator.human_replay_stats = all_hr or None
     evaluator.self_play_stats = all_sp or None
     combined = evaluator.save(result_dir)
-    _print_summary("combined (all seeds)", evaluator, args.localized, args.globally)
+    _print_summary("combined (all seeds)", evaluator)
     print(f"\nwrote combined {combined['n_rows']} rows -> {combined['jsonl']}")
     print(f"wrote combined {combined['n_scenarios']} scenarios -> {combined['csv']}")
     print(f"wrote category summary -> {combined['summary']}")
