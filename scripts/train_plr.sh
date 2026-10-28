@@ -62,10 +62,12 @@ WANDB_PROJECT="${WANDB_PROJECT:-scp_drive}"
 WANDB_GROUP="${WANDB_GROUP:-${SCORE_GROUP}}"
 TAG_PREFIX="${TAG_PREFIX:-${SCORE_GROUP}}"
 
-EVAL_ARGS=()
+# SP eval always rolls 200 training maps (live PLR hard tail). HR needs
+# validation counts; skip HR only when that file is missing.
+EVAL_ARGS=(--eval.self-play-eval True --eval.score-tail-k 200)
 if [[ ! -f "${EVAL_COUNTS}" ]]; then
-  echo "no ${EVAL_COUNTS}; turning eval off for this run" >&2
-  EVAL_ARGS+=(--eval.human-replay-eval False --eval.self-play-eval False)
+  echo "no ${EVAL_COUNTS}; turning human-replay eval off (SP train-200 stays on)" >&2
+  EVAL_ARGS+=(--eval.human-replay-eval False)
 fi
 
 echo "========== puffer_drive PLR =========="
@@ -79,8 +81,9 @@ echo "  strategy=prioritized score=${MAP_SCORE}"
 echo "  seeds=${SEEDS[*]}"
 echo "  total_timesteps=${TOTAL_TIMESTEPS}"
 echo "  num_maps=${NUM_MAPS}"
-echo "  wandb entity=${WANDB_ENTITY} project=${WANDB_PROJECT} group=${WANDB_GROUP}"
-echo "======================================"
+  echo "  wandb entity=${WANDB_ENTITY} project=${WANDB_PROJECT} group=${WANDB_GROUP}"
+  echo "  sp_eval=train score_tail_k=200  hr_eval=$([[ -f "${EVAL_COUNTS}" ]] && echo on || echo off)"
+  echo "======================================"
 
 for SEED in "${SEEDS[@]}"; do
   echo ""
