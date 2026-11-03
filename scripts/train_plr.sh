@@ -53,7 +53,7 @@ MAP_SCORE="${MAP_SCORE:-max_mc}"
 case "${MAP_SCORE}" in
   max_mc)
     SCORE_GROUP="maxmc"
-    PLR_TEMPERATURE="${PLR_TEMPERATURE:-2}"
+    PLR_TEMPERATURE="${PLR_TEMPERATURE:-4}"
     PLR_STALENESS="${PLR_STALENESS:-0.3}"
     ;;
   learnability)

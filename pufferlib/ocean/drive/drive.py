@@ -140,6 +140,7 @@ class Drive(pufferlib.PufferEnv):
         self._plr_values = None
         self._plr_dones = None
         self._plr_successes = None
+        self._plr_unsafe = None
         if self.level_sampler is not None:
             if self.map_score in ("max_mc", "pvl"):
                 self._plr_value_buf = buf.get("values") if isinstance(buf, dict) and "values" in buf else None
@@ -149,6 +150,8 @@ class Drive(pufferlib.PufferEnv):
             elif self.map_score in ("learnability", "learnability_hard"):
                 self._plr_successes = []
                 self._plr_dones = []
+                if self.map_score == "learnability_hard":
+                    self._plr_unsafe = []
         self.reward_vehicle_collision = reward_vehicle_collision
         self.reward_offroad_collision = reward_offroad_collision
         self.reward_goal = reward_goal
@@ -424,6 +427,7 @@ class Drive(pufferlib.PufferEnv):
         if learn_ready:
             successes = np.stack(self._plr_successes)
             dones = np.stack(self._plr_dones)
+            unsafe = None if self._plr_unsafe is None else np.stack(self._plr_unsafe)
         elif rollout_ready:
             rewards = np.stack(self._plr_rewards)
             values = np.stack(self._plr_values)
@@ -439,7 +443,11 @@ class Drive(pufferlib.PufferEnv):
                 # Writes LevelSampler.scores[map_id] and returns that buffer value.
                 if learn_ready:
                     score = self.level_sampler.score(
-                        map_id, self.map_score, successes=successes[:, sl], dones=dones[:, sl]
+                        map_id,
+                        self.map_score,
+                        successes=successes[:, sl],
+                        dones=dones[:, sl],
+                        unsafe=None if unsafe is None else unsafe[:, sl],
                     )
                 else:
                     score = self.level_sampler.score(
@@ -457,6 +465,8 @@ class Drive(pufferlib.PufferEnv):
             self._plr_dones.clear()
         if self._plr_successes is not None:
             self._plr_successes.clear()
+        if self._plr_unsafe is not None:
+            self._plr_unsafe.clear()
         if map_ids and not rollout_ready and not learn_ready:
             self.level_sampler.update_batch(map_ids, scores)
             scores = [float(self.level_sampler.scores[map_id]) for map_id in map_ids]
@@ -477,8 +487,11 @@ class Drive(pufferlib.PufferEnv):
             return
         dones = np.logical_or(self.terminals, self.truncations)
         if self.map_score in ("learnability", "learnability_hard"):
-            self._plr_successes.append((np.asarray(self.rewards) > 0).astype(np.float32).copy())
+            rewards = np.asarray(self.rewards)
+            self._plr_successes.append((rewards > 0).astype(np.float32).copy())
             self._plr_dones.append(dones.copy())
+            if self._plr_unsafe is not None:
+                self._plr_unsafe.append((rewards < 0).astype(np.float32).copy())
             return
         if self._plr_value_buf is not None:
             values = np.asarray(self._plr_value_buf, dtype=np.float32).reshape(-1)
