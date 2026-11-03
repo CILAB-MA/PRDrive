@@ -9,7 +9,7 @@ import pufferlib
 import math
 from enum import IntEnum
 from pufferlib.ocean.drive import binding
-from pufferlib.ocean.drive.level_sampler import LevelSampler
+from pufferlib.ocean.drive.level_sampler import LevelSampler, plr_hypers_for_score
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -88,7 +88,9 @@ class Drive(pufferlib.PufferEnv):
         obs_partner_noise_pos=0.0,
         async_resets=True,
         map_sampling_strategy="uniform",  # "uniform", "prioritized", or "sequential"
-        map_score="return",  # "return", "max_mc", "pvl", or "learnability"
+        map_score="return",  # "return", "max_mc", "pvl", "learnability", or "learnability_hard"
+        plr_temperature=None,  # rank β; None uses the CL4AD preset for map_score
+        plr_staleness_coef=None,  # staleness ρ; None uses the CL4AD preset for map_score
         eval_map_log_path=None,  # eval only: save per-map logs (see _dump_map_logs)
         map_id_queue=None,  # optional explicit map ids for eval; C still stops at the agent budget
     ):
@@ -107,10 +109,14 @@ class Drive(pufferlib.PufferEnv):
         # instead (see binding.c: my_shared's map_id_queue).
         self.map_sampling_strategy = map_sampling_strategy
         self.map_score = map_score
-        if map_score not in ("return", "max_mc", "pvl", "learnability"):
+        if map_score not in ("return", "max_mc", "pvl", "learnability", "learnability_hard"):
             raise ValueError(
-                f"map_score must be 'return', 'max_mc', 'pvl', or 'learnability'. Got: {map_score!r}"
+                "map_score must be 'return', 'max_mc', 'pvl', 'learnability', or "
+                f"'learnability_hard'. Got: {map_score!r}"
             )
+        self.plr_temperature, self.plr_staleness_coef = plr_hypers_for_score(
+            map_score, temperature=plr_temperature, staleness_coef=plr_staleness_coef
+        )
         if map_sampling_strategy == "uniform":
             self.level_sampler = None
         elif map_sampling_strategy in ("prioritized", "sequential"):
@@ -118,6 +124,10 @@ class Drive(pufferlib.PufferEnv):
                 num_maps=num_maps,
                 seed=seed,
                 strategy=map_sampling_strategy,
+                temperature=self.plr_temperature,
+                staleness_coef=self.plr_staleness_coef,
+                max_controlled_agents=max_controlled_agents,
+                invert_scores=map_score in ("return", "episode_return"),
             )
         else:
             raise ValueError(
@@ -136,7 +146,7 @@ class Drive(pufferlib.PufferEnv):
                 self._plr_rewards = []
                 self._plr_values = []
                 self._plr_dones = []
-            elif self.map_score == "learnability":
+            elif self.map_score in ("learnability", "learnability_hard"):
                 self._plr_successes = []
                 self._plr_dones = []
         self.reward_vehicle_collision = reward_vehicle_collision
@@ -458,10 +468,15 @@ class Drive(pufferlib.PufferEnv):
         self._pending_values = np.asarray(values, dtype=np.float32).reshape(-1)
 
     def _record_plr_step(self):
-        if self.level_sampler is None or self.map_score not in ("max_mc", "pvl", "learnability"):
+        if self.level_sampler is None or self.map_score not in (
+            "max_mc",
+            "pvl",
+            "learnability",
+            "learnability_hard",
+        ):
             return
         dones = np.logical_or(self.terminals, self.truncations)
-        if self.map_score == "learnability":
+        if self.map_score in ("learnability", "learnability_hard"):
             self._plr_successes.append((np.asarray(self.rewards) > 0).astype(np.float32).copy())
             self._plr_dones.append(dones.copy())
             return

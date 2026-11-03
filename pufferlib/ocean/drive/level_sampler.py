@@ -17,9 +17,11 @@ class LevelSampler:
         alpha=1.0,  # score EMA rate: new = (1 - alpha) * old + alpha * latest
         eps=1e-3,  # power-transform smoothing so a never-updated score isn't exactly 0
         seed=None,
-        agent_aggregate="mean",  # how per-agent scores collapse to one map score
+        score_aggregate="mean",  # how per-agent scores collapse to one map score
         gae_gamma=0.99,  # discount used when PVL builds GAE from a stored rollout
         gae_lambda=0.95,  # GAE lambda used when PVL builds advantages from a stored rollout
+        max_controlled_agents=32,  # per-vehicle MaxMC R_max slots, matching Drive max_controlled_agents
+        invert_scores=False,  # if True, rank low stored scores first (episode return)
     ):
         if strategy not in ("prioritized", "uniform", "sequential"):
             raise ValueError(
@@ -44,11 +46,15 @@ class LevelSampler:
         self.nu = float(nu)
         self.alpha = float(alpha)
         self.eps = float(eps)
-        self.agent_aggregate = agent_aggregate
-        if self.agent_aggregate not in ("mean", "max", "min"):
-            raise ValueError(f"agent_aggregate must be 'mean', 'max', or 'min', got {agent_aggregate!r}")
+        self.score_aggregate = score_aggregate
+        if self.score_aggregate not in ("mean", "max", "min"):
+            raise ValueError(f"score_aggregate must be 'mean', 'max', or 'min', got {score_aggregate!r}")
         self.gae_gamma = float(gae_gamma)
         self.gae_lambda = float(gae_lambda)
+        self.max_controlled_agents = int(max_controlled_agents)
+        if self.max_controlled_agents < 1:
+            raise ValueError("max_controlled_agents must be >= 1")
+        self.invert_scores = bool(invert_scores)
         self._rng = np.random.default_rng(seed)
 
         # Per-map state.
@@ -56,8 +62,8 @@ class LevelSampler:
         self.staleness = np.zeros(self.num_maps, dtype=np.float64)
         self.seen = np.zeros(self.num_maps, dtype=bool)
 
-        # Best episodic return seen on each map. Used by MaxMC (minimax compute_max_mc).
-        self.max_returns = np.zeros(self.num_maps, dtype=np.float64)
+        self.max_returns = np.zeros((self.num_maps, self.max_controlled_agents), dtype=np.float64)
+        self.max_return_valid = np.zeros((self.num_maps, self.max_controlled_agents), dtype=bool)
         self._next_index = 0
 
     # ---- weighting -------------------------------------------------
@@ -67,20 +73,16 @@ class LevelSampler:
         if transform == "power":
             e = 0.0 if self.staleness_coef > 0 else self.eps
             return (values + e) ** (1.0 / temperature)
-        # "rank": highest value gets rank 1, weight 1 / rank^(1/temperature).
-        # Matches minimax PLR when use_score_ranks=True. Sign of the score
-        # only changes order, so negative MaxMC scores stay valid weights.
         order = np.flip(values.argsort())
         ranks = np.empty_like(order)
         ranks[order] = np.arange(len(order)) + 1
         return 1.0 / (ranks ** (1.0 / temperature))
 
     def _sample_weights(self):
-        """Sampling distribution over already-seen maps, blending score and staleness."""
         score_values = np.array(self.scores, copy=True)
+        if self.invert_scores:
+            score_values = -score_values
         if self.score_transform == "rank":
-            # Unseen maps are not scored. Keep them below every real score so
-            # they do not take the top ranks away from negative MaxMC scores.
             score_values[~self.seen] = -np.inf
         weights = self._transform(self.score_transform, self.temperature, score_values)
         weights = weights * self.seen  # never-scored maps get zero weight here
@@ -111,7 +113,6 @@ class LevelSampler:
         if total > 0 and np.isfinite(total):
             map_id = int(self._rng.choice(self.num_maps, p=weights / total))
         else:
-            # Nothing scored yet despite being "seen" (shouldn't normally happen) -- fall back.
             map_id = int(self._rng.integers(self.num_maps))
         self._touch(map_id)
         return map_id
@@ -144,18 +145,6 @@ class LevelSampler:
         return self._sample_unseen()
 
     def sample_batch(self, batch_size):
-        """Return an ordered (int32) array of `batch_size` candidate map ids.
-
-        This is what gets passed to `binding.shared(map_id_queue=...)`. C
-        walks the array in order and stops once it has collected enough
-        controllable agents, so `batch_size` should comfortably over-estimate
-        how many maps a resample could plausibly need -- unused entries at
-        the tail are simply never consumed.
-
-        Returns (map_ids, metrics) where metrics is a small dict suitable
-        for logging (matches the wandb_metrics convention used by
-        CurriculumSampler.sample() / AgentSampler.sample()).
-        """
         out = np.empty(int(batch_size), dtype=np.int32)
         for i in range(out.shape[0]):
             out[i] = self.sample_one()
@@ -170,12 +159,6 @@ class LevelSampler:
         return out, metrics
 
     def sample_until(self, agent_counts, agent_budget):
-        """Sample maps until their controllable-agent counts cover `agent_budget`.
-
-        `agent_counts[map_id]` is the count C's `set_active_agents` reports for
-        that map. A map is taken whole, so the sum may exceed the budget; the
-        next call continues at the following map. Returns (map_ids, metrics).
-        """
         agent_counts = np.asarray(agent_counts)
         if agent_counts.shape[0] < self.num_maps:
             raise ValueError(
@@ -239,16 +222,26 @@ class LevelSampler:
         dones: (T, A) float. 1 where that agent ends an episode at that step, else 0.
         T is the steps recorded since the last resample. A is the controllable agents on this map.
 
-        self.max_returns[map_id]: scalar. Best episodic return seen on this map so far.
-        agent_scores: (A,) float. Each agent's mean of (map best return - V(s)).
-        new_max: scalar. max(previous max_returns[map_id], best return in this visit).
-        reduced: scalar. agent_scores collapsed by agent_aggregate ("mean", "max", or "min").
+        self.max_returns[map_id]: (max_controlled_agents,) best episodic return per vehicle so far.
+        self.max_return_valid[map_id]: True only for vehicles that have a stored R_max.
+            Unused padding stays False so a 0 slot is not treated as R_max=0.
+        agent_scores: (A,) float. Each agent's mean of (that agent's R_max - V(s)).
+        new_max: (A,) updated per-vehicle max returns for this visit.
+        reduced: scalar. agent_scores collapsed by score_aggregate ("mean", "max", or "min").
         scores[map_id]: scalar buffer. EMA of reduced. This is the value Drive reads.
         """
         map_id = int(map_id)
-        agent_scores, new_max = compute_agent_max_mc(rewards, values, dones, self.max_returns[map_id])
-        self.max_returns[map_id] = new_max
-        reduced = aggregate_agent_scores(agent_scores, self.agent_aggregate)
+        rewards = np.asarray(rewards)
+        n_agents = 1 if rewards.ndim < 2 else int(rewards.shape[1])
+        n_store = min(n_agents, self.max_returns.shape[1])
+        prev = np.full(n_agents, -np.inf, dtype=np.float64)
+        valid = self.max_return_valid[map_id, :n_store]
+        prev[:n_store] = np.where(valid, self.max_returns[map_id, :n_store], -np.inf)
+        agent_scores, new_max = compute_agent_max_mc(rewards, values, dones, prev)
+        new_max = np.asarray(new_max, dtype=np.float64).reshape(-1)
+        self.max_returns[map_id, :n_store] = new_max[:n_store]
+        self.max_return_valid[map_id, :n_store] = True
+        reduced = aggregate_agent_scores(agent_scores[:n_store], self.score_aggregate)
         self.update(map_id, reduced)
         return float(self.scores[map_id])
 
@@ -262,7 +255,7 @@ class LevelSampler:
         then mean over episodes (unfinished tail counts, same as MaxMC).
         """
         map_id = int(map_id)
-        reduced = aggregate_agent_scores(compute_agent_pvl(advantages, dones), self.agent_aggregate)
+        reduced = aggregate_agent_scores(compute_agent_pvl(advantages, dones), self.score_aggregate)
         self.update(map_id, reduced)
         return float(self.scores[map_id])
 
@@ -288,9 +281,8 @@ class LevelSampler:
         successes: (T, A) 1 on steps where that agent reached its goal, else 0.
             An episode succeeds if it hit the goal at least once.
         dones: (T, A) optional. 1 where that agent ends an episode.
-        The map score is p(1-p) where p is the fraction of episodes (pooled
-        across agents on this map) that reached the goal. Peaks at 0.25 when
-        half the episodes succeed.
+        The map score is the mean over vehicles of p_n(1-p_n). Peaks at 0.25
+        when a vehicle succeeds on half of its own episodes.
         """
         map_id = int(map_id)
         reduced = compute_learnability(successes, dones)
@@ -341,7 +333,9 @@ def merge_sampler_states(states):
     return merged_scores, merged_seen
 
 
-def score_replay_weights(scores, seen, score_transform="rank", temperature=2.0, eps=1e-3):
+def score_replay_weights(
+    scores, seen, score_transform="rank", temperature=2.0, eps=1e-3, invert_scores=False
+):
     scores = np.asarray(scores, dtype=np.float64).reshape(-1)
     seen = np.asarray(seen, dtype=bool).reshape(-1)
     sampler = LevelSampler(
@@ -350,39 +344,88 @@ def score_replay_weights(scores, seen, score_transform="rank", temperature=2.0, 
         temperature=temperature,
         staleness_coef=0.0,
         eps=eps,
+        invert_scores=invert_scores,
     )
     sampler.scores = np.array(scores, copy=True)
     sampler.seen = np.array(seen, copy=True)
     return sampler._sample_weights()
 
 
-def _normalize_score_function(score_function):
+# 0 is rank temperature, 1 is staleness coefficient.
+PLR_SCORE_HYPERS = {
+    "max_mc": (2.0, 0.3),
+    "pvl": (4.0, 0.3),
+    "learnability": (4.0, 0.1),
+    "learnability_hard": (2.0, 0.1),
+    "return": (2.0, 0.3),
+}
+
+
+def _score_key(score_function):
     name = str(score_function).strip().lower().replace("-", "_")
     if name in ("maxmc", "max_mc"):
         return "max_mc"
     if name in ("pvl", "positive_value_loss"):
         return "pvl"
-    if name in ("return", "learnability"):
-        return name
+    if name in ("learn_hard", "learnability_hard"):
+        return "learnability_hard"
+    if name in ("learn", "learnability"):
+        return "learnability"
+    if name in ("return", "episode_return"):
+        return "return"
     return name
 
 
-def aggregate_agent_scores(agent_scores, agent_aggregate="mean"):
+def plr_hypers_for_score(map_score, temperature=None, staleness_coef=None):
+    """CL4AD 10K (β, ρ) for a map score. Explicit values win over the preset."""
+    beta, rho = PLR_SCORE_HYPERS.get(_score_key(map_score), (2.0, 0.3))
+    if temperature is not None:
+        beta = float(temperature)
+    if staleness_coef is not None:
+        rho = float(staleness_coef)
+    return beta, rho
+
+
+def _normalize_score_function(score_function):
+    name = _score_key(score_function)
+    if name == "learnability_hard":
+        return "learnability"
+    return name
+
+
+def aggregate_agent_scores(agent_scores, score_aggregate="mean"):
     """Collapse one score per agent into the score for their map."""
     agent_scores = np.asarray(agent_scores, dtype=np.float64).reshape(-1)
     if agent_scores.size == 0:
         return 0.0
-    if agent_aggregate == "mean":
+    if score_aggregate == "mean":
         return float(agent_scores.mean())
-    if agent_aggregate == "max":
+    if score_aggregate == "max":
         return float(agent_scores.max())
-    if agent_aggregate == "min":
+    if score_aggregate == "min":
         return float(agent_scores.min())
-    raise ValueError(f"agent aggregate must be 'mean', 'max', or 'min', got {agent_aggregate!r}")
+    raise ValueError(f"agent aggregate must be 'mean', 'max', or 'min', got {score_aggregate!r}")
+
+
+def _broadcast_agent_max_return(max_return, n_agents):
+    prev = np.asarray(max_return, dtype=np.float64)
+    if prev.ndim == 0:
+        return np.full(n_agents, float(prev), dtype=np.float64)
+    prev = prev.reshape(-1)
+    if prev.shape[0] == n_agents:
+        return np.array(prev, copy=True)
+    out = np.zeros(n_agents, dtype=np.float64)
+    n = min(n_agents, prev.shape[0])
+    out[:n] = prev[:n]
+    return out
 
 
 def compute_agent_max_mc(rewards, values, dones, max_return):
-    """Per-agent MaxMC. Returns (agent_scores, updated_max_return)."""
+    """Per-agent MaxMC. Returns (agent_scores, updated_max_return).
+
+    ``max_return`` is a scalar or (A,) best episodic return per vehicle.
+    Each vehicle uses its own \(R_{\max}^{\theta,n}\), not a shared map max.
+    """
     rewards = np.asarray(rewards, dtype=np.float64)
     values = np.asarray(values, dtype=np.float64)
     dones = np.asarray(dones, dtype=np.float64)
@@ -393,9 +436,11 @@ def compute_agent_max_mc(rewards, values, dones, max_return):
     if rewards.shape != values.shape or rewards.shape != dones.shape:
         raise ValueError("rewards, values, and dones must have the same shape")
     if rewards.size == 0:
-        return np.zeros(0, dtype=np.float64), float(max_return)
+        prev = np.asarray(max_return, dtype=np.float64).reshape(-1)
+        return np.zeros(0, dtype=np.float64), prev
 
     timesteps, agents = rewards.shape
+    prev = _broadcast_agent_max_return(max_return, agents)
     partial_return = np.zeros(agents, dtype=np.float64)
     max_ep_return = np.full(agents, -np.inf, dtype=np.float64)
     for t in range(timesteps):
@@ -405,14 +450,14 @@ def compute_agent_max_mc(rewards, values, dones, max_return):
         partial_return = np.where(done, 0.0, partial_return)
     # Unfinished tail still counts as an episode return.
     max_ep_return = np.where(np.isfinite(max_ep_return), max_ep_return, partial_return)
-    level_max = max(float(max_return), float(max_ep_return.max()))
+    agent_max = np.maximum(prev, max_ep_return)
 
     partial_gap = np.zeros(agents, dtype=np.float64)
     partial_steps = np.zeros(agents, dtype=np.float64)
     sum_ep_gap = np.zeros(agents, dtype=np.float64)
     n_episodes = np.zeros(agents, dtype=np.float64)
     for t in range(timesteps):
-        partial_gap += level_max - values[t]
+        partial_gap += agent_max - values[t]
         partial_steps += 1.0
         done = dones[t] > 0
         sum_ep_gap += np.where(done, partial_gap / partial_steps, 0.0)
@@ -424,17 +469,18 @@ def compute_agent_max_mc(rewards, values, dones, max_return):
     sum_ep_gap = np.where(open_tail, sum_ep_gap + tail_gap, sum_ep_gap)
     n_episodes = np.where(open_tail, n_episodes + 1.0, n_episodes)
     n_episodes = np.maximum(n_episodes, 1.0)
-    return sum_ep_gap / n_episodes, level_max
+    return sum_ep_gap / n_episodes, agent_max
 
 
-def compute_max_mc(rewards, values, dones, max_return, agent_aggregate="mean"):
+def compute_max_mc(rewards, values, dones, max_return, score_aggregate="mean"):
     """Agent MaxMC scores reduced to one map score.
 
-    Returns (map_score, updated_max_return). ``agent_aggregate`` selects how
-    the per-agent scores are combined.
+    Returns (map_score, updated_max_return) where ``updated_max_return`` is
+    (A,) per-vehicle \(R_{\max}\). ``score_aggregate`` selects how the
+    per-agent scores are combined.
     """
-    agent_scores, level_max = compute_agent_max_mc(rewards, values, dones, max_return)
-    return aggregate_agent_scores(agent_scores, agent_aggregate), level_max
+    agent_scores, agent_max = compute_agent_max_mc(rewards, values, dones, max_return)
+    return aggregate_agent_scores(agent_scores, score_aggregate), agent_max
 
 
 def compute_gae(rewards, values, dones, gamma=0.99, gae_lambda=0.95):
@@ -508,20 +554,21 @@ def compute_agent_pvl(advantages, dones):
     return sum_ep / n_episodes
 
 
-def compute_pvl(advantages, dones, agent_aggregate="mean"):
+def compute_pvl(advantages, dones, score_aggregate="mean"):
     """Agent PVL scores reduced to one map score."""
-    return aggregate_agent_scores(compute_agent_pvl(advantages, dones), agent_aggregate)
+    return aggregate_agent_scores(compute_agent_pvl(advantages, dones), score_aggregate)
 
 
 def compute_learnability(successes, dones=None):
-    """Map learnability p(1-p) from binary goal success.
+    """Map learnability as mean over vehicles of p_n(1-p_n).
 
     successes: (T, A) flag that the agent reached its goal at that step, or a
-        1d array of already-finished episode outcomes.
+        1d array of already-finished episode outcomes for one agent.
     dones: (T, A) optional episode ends. An episode succeeds if it saw a goal
         hit at least once. Unfinished tails count, same as MaxMC.
-    Episodes are pooled across agents on the map. Per-agent p_i(1-p_i) would
-        collapse to 0 whenever each agent only finishes one episode.
+    Each vehicle gets its own success rate p_n. Always-succeed and
+    always-fail vehicles both contribute 0, so a 50/50 split across cars
+    is not treated as high learnability.
     """
     successes = np.asarray(successes, dtype=np.float64)
     if successes.size == 0:
@@ -541,22 +588,22 @@ def compute_learnability(successes, dones=None):
     timesteps, agents = successes.shape
     partial_hit = np.zeros(agents, dtype=np.float64)
     partial_steps = np.zeros(agents, dtype=np.float64)
-    n_success = 0.0
-    n_episodes = 0.0
+    n_success = np.zeros(agents, dtype=np.float64)
+    n_episodes = np.zeros(agents, dtype=np.float64)
     for t in range(timesteps):
         partial_hit = np.maximum(partial_hit, (successes[t] > 0).astype(np.float64))
         partial_steps += 1.0
         done = dones[t] > 0
-        n_success += float(np.where(done, partial_hit, 0.0).sum())
-        n_episodes += float(done.sum())
+        n_success += np.where(done, partial_hit, 0.0)
+        n_episodes += done.astype(np.float64)
         partial_hit = np.where(done, 0.0, partial_hit)
         partial_steps = np.where(done, 0.0, partial_steps)
     open_tail = partial_steps > 0
-    n_success += float(np.where(open_tail, partial_hit, 0.0).sum())
-    n_episodes += float(open_tail.sum())
-    n_episodes = max(n_episodes, 1.0)
+    n_success += np.where(open_tail, partial_hit, 0.0)
+    n_episodes += open_tail.astype(np.float64)
+    n_episodes = np.maximum(n_episodes, 1.0)
     p = n_success / n_episodes
-    return float(p * (1.0 - p))
+    return float(np.mean(p * (1.0 - p)))
 
 
 def compute_score(
@@ -568,12 +615,12 @@ def compute_score(
     rewards=None,
     advantages=None,
     successes=None,
-    agent_aggregate="mean",
+    score_aggregate="mean",
     gamma=0.99,
     gae_lambda=0.95,
 ):
     """Pick MaxMC, PVL, or learnability. Returns (map_score, extra) where extra
-    is the updated max return for MaxMC and NaN otherwise.
+    is the per-vehicle updated max return for MaxMC and NaN otherwise.
 
     Mirrors Kinetix ``compute_score``. PVL uses ``advantages`` when given,
     otherwise GAE from ``rewards`` / ``values`` / ``dones``. Learnability uses
@@ -581,11 +628,11 @@ def compute_score(
     """
     name = _normalize_score_function(score_function)
     if name == "max_mc":
-        return compute_max_mc(rewards, values, dones, max_return, agent_aggregate)
+        return compute_max_mc(rewards, values, dones, max_return, score_aggregate)
     if name == "pvl":
         if advantages is None:
             advantages = compute_gae(rewards, values, dones, gamma, gae_lambda)
-        return compute_pvl(advantages, dones, agent_aggregate), float("nan")
+        return compute_pvl(advantages, dones, score_aggregate), float("nan")
     if name == "learnability":
         return compute_learnability(successes, dones), float("nan")
     raise ValueError(f"Unknown score function: {score_function!r}")

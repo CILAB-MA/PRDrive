@@ -909,7 +909,7 @@ def structure_scalars(logs, prefix="analyze/structure"):
     return stats, map_categories
 
 
-def analyze_scalars(logs, plr_state=None, prefix="analyze"):
+def analyze_scalars(logs, plr_state=None, prefix="analyze", map_score="max_mc"):
     """Structure split plus window means, keyed for wandb ``analyze/`` panels."""
     populated = [
         log
@@ -944,7 +944,10 @@ def analyze_scalars(logs, plr_state=None, prefix="analyze"):
     cats = np.array([map_categories[int(i)] for i in ids])
     window_seen = seen[ids]
     stats[f"{struct}/plr_seen_frac"] = float(window_seen.mean())
-    weights = score_replay_weights(scores, seen)
+    score_name = str(map_score or "max_mc").lower().replace("-", "_")
+    weights = score_replay_weights(
+        scores, seen, invert_scores=score_name in ("return", "episode_return")
+    )
     denom_ids = ids[window_seen]
     denom = float(weights[denom_ids].sum()) if denom_ids.size else 0.0
     for cat in STRUCTURE_CATEGORIES:
@@ -959,9 +962,9 @@ def analyze_scalars(logs, plr_state=None, prefix="analyze"):
 def score_tail_map_ids(plr_state, k, map_dir, num_maps, tail=None, map_score="max_mc"):
     """Live hard-k training maps from the current sampler state.
 
-    Defaults to the hard end of the stored score: high MaxMC/PVL/learnability,
-    low episode-return. Rank transform is not applied. Falls back to file-order
-    maps if nothing has been seen yet.
+    Defaults to the hard end of the stored score: high MaxMC/PVL/learnability
+    (/learnability_hard), low episode-return. Rank transform is not applied.
+    Falls back to file-order maps if nothing has been seen yet.
     """
     k = int(k) if k is not None else 200
     num_maps = int(num_maps)
@@ -1434,6 +1437,12 @@ class Evaluator:
                 stats["eval/sp_score"] = float(np.mean([log["score"] for log in populated]))
                 stats["eval/sp_num_agents"] = float(np.mean([log["n"] for log in populated]))
             stats.update(tail_rank_scalars(self.train_sp_queue, plr_state=plr_state))
-            stats.update(analyze_scalars(self.self_play_stats, plr_state=plr_state))
+            stats.update(
+                analyze_scalars(
+                    self.self_play_stats,
+                    plr_state=plr_state,
+                    map_score=self.configs.get("env", {}).get("map_score", "max_mc"),
+                )
+            )
 
         return stats

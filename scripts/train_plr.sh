@@ -2,15 +2,19 @@
 # Train puffer_drive with Prioritized Level Replay.
 #
 # Overrides map_sampling_strategy to prioritized. Map scores default to MaxMC
-# (MAP_SCORE=max_mc; also return, pvl, learnability). The queue length comes
-# from controllable_counts.npy next to the training bins.
+# (MAP_SCORE=max_mc; also return, pvl, learnability, learnability_hard).
+# CL4AD 10K rank β / staleness ρ are set from MAP_SCORE unless PLR_TEMPERATURE
+# or PLR_STALENESS is exported. The queue length comes from
+# controllable_counts.npy next to the training bins.
 #
 # Usage:
 #   ./scripts/train_plr.sh 0 maxmc_10k
 #   MAP_SCORE=learnability ./scripts/train_plr.sh 1 learn_10k
+#   MAP_SCORE=learnability_hard ./scripts/train_plr.sh 1 learn_hard_10k
 #   MAP_SCORE=pvl ./scripts/train_plr.sh 0 pvl_10k
 #
-# wandb group follows MAP_SCORE: max_mc → maxmc, learnability → learn.
+# wandb group follows MAP_SCORE: max_mc → maxmc, learnability → learn,
+# learnability_hard → learn_hard.
 #
 # Args:
 #   $1  GPU id
@@ -47,9 +51,37 @@ TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-2000000000}"
 NUM_MAPS="${NUM_MAPS:-10000}"
 MAP_SCORE="${MAP_SCORE:-max_mc}"
 case "${MAP_SCORE}" in
-  max_mc) SCORE_GROUP="maxmc" ;;
-  learnability) SCORE_GROUP="learn" ;;
-  *) SCORE_GROUP="${MAP_SCORE}" ;;
+  max_mc)
+    SCORE_GROUP="maxmc"
+    PLR_TEMPERATURE="${PLR_TEMPERATURE:-2}"
+    PLR_STALENESS="${PLR_STALENESS:-0.3}"
+    ;;
+  learnability)
+    SCORE_GROUP="learn"
+    PLR_TEMPERATURE="${PLR_TEMPERATURE:-4}"
+    PLR_STALENESS="${PLR_STALENESS:-0.1}"
+    ;;
+  learnability_hard|learn_hard)
+    MAP_SCORE="learnability_hard"
+    SCORE_GROUP="learn_hard"
+    PLR_TEMPERATURE="${PLR_TEMPERATURE:-2}"
+    PLR_STALENESS="${PLR_STALENESS:-0.1}"
+    ;;
+  pvl)
+    SCORE_GROUP="pvl"
+    PLR_TEMPERATURE="${PLR_TEMPERATURE:-4}"
+    PLR_STALENESS="${PLR_STALENESS:-0.3}"
+    ;;
+  return)
+    SCORE_GROUP="return"
+    PLR_TEMPERATURE="${PLR_TEMPERATURE:-2}"
+    PLR_STALENESS="${PLR_STALENESS:-0.3}"
+    ;;
+  *)
+    SCORE_GROUP="${MAP_SCORE}"
+    PLR_TEMPERATURE="${PLR_TEMPERATURE:-2}"
+    PLR_STALENESS="${PLR_STALENESS:-0.3}"
+    ;;
 esac
 
 if [[ ! -f "${COUNTS}" ]]; then
@@ -77,7 +109,7 @@ echo "  GPU=${GPU_ID}"
 echo "  exp=${EXP_NAME}"
 echo "  data_dir=${DATA_DIR}"
 echo "  map_dir=${MAP_DIR}"
-echo "  strategy=prioritized score=${MAP_SCORE}"
+echo "  strategy=prioritized score=${MAP_SCORE} β=${PLR_TEMPERATURE} ρ=${PLR_STALENESS}"
 echo "  seeds=${SEEDS[*]}"
 echo "  total_timesteps=${TOTAL_TIMESTEPS}"
 echo "  num_maps=${NUM_MAPS}"
@@ -91,6 +123,8 @@ for SEED in "${SEEDS[@]}"; do
   CUDA_VISIBLE_DEVICES="${GPU_ID}" puffer train puffer_drive \
     --env.map-sampling-strategy prioritized \
     --env.map-score "${MAP_SCORE}" \
+    --env.plr-temperature "${PLR_TEMPERATURE}" \
+    --env.plr-staleness-coef "${PLR_STALENESS}" \
     --env.map-dir "${MAP_DIR}" \
     --env.num-maps "${NUM_MAPS}" \
     --train.seed "${SEED}" \
