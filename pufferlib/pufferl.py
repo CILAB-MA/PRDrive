@@ -39,6 +39,7 @@ import pufferlib.utils
 from pufferlib.ocean.benchmark.evaluator import (
     Evaluator,
     collect_train_plr_state,
+    save_plr_state,
     score_tail_map_ids,
 )
 
@@ -700,6 +701,7 @@ class PuffeRL:
             human_replay_eval = self.config["eval"]["human_replay_eval"]
             self_play_eval = self.config["eval"]["self_play_eval"]
             plr_state = collect_train_plr_state(self.vecenv, self._plr_worker_states)
+            self._save_plr_buffer(plr_state)
             score_tail_ids = None
             if self_play_eval:
                 eval_cfg = self.full_args.get("eval", {})
@@ -842,6 +844,7 @@ class PuffeRL:
 
         model_name = f"model_{self.config['env']}_{self.epoch:06d}.pt"
         model_path = os.path.join(path, model_name)
+        self._save_plr_buffer(out_dir=path)
         if os.path.exists(model_path):
             return model_path
 
@@ -879,6 +882,29 @@ class PuffeRL:
             self.logger.wandb.run.log_artifact(artifact)
 
         return model_path
+
+    def _save_plr_buffer(self, plr_state=None, out_dir=None):
+        if plr_state is None:
+            plr_state = collect_train_plr_state(self.vecenv, self._plr_worker_states)
+        if plr_state is None:
+            return None
+        if out_dir is None:
+            out_dir = os.path.join(self.config["data_dir"], f"{self.config['env']}_{self.logger.run_id}")
+        os.makedirs(out_dir, exist_ok=True)
+        payload_epoch = self.epoch
+        payload_step = self.global_step
+        save_plr_state(
+            os.path.join(out_dir, f"plr_state_{payload_epoch:06d}.npz"),
+            plr_state,
+            epoch=payload_epoch,
+            global_step=payload_step,
+        )
+        return save_plr_state(
+            os.path.join(out_dir, "plr_state.latest.npz"),
+            plr_state,
+            epoch=payload_epoch,
+            global_step=payload_step,
+        )
 
     def _export_to_bin(self):
         """Export latest checkpoint to .bin for rendering."""

@@ -1031,6 +1031,30 @@ def agents_for_map_ids(map_dir, map_ids, num_maps):
     return max(total, 1)
 
 
+def save_plr_state(path, plr_state, epoch=None, global_step=None):
+    if plr_state is None:
+        return None
+    scores, seen = plr_state
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    np.savez_compressed(
+        path,
+        scores=np.asarray(scores, dtype=np.float64),
+        seen=np.asarray(seen, dtype=bool),
+        epoch=np.int64(-1 if epoch is None else epoch),
+        global_step=np.int64(-1 if global_step is None else global_step),
+    )
+    return path
+
+
+def load_plr_state(path):
+    with np.load(path) as data:
+        scores = np.asarray(data["scores"], dtype=np.float64)
+        seen = np.asarray(data["seen"], dtype=bool)
+        epoch = int(data["epoch"]) if "epoch" in data else None
+        global_step = int(data["global_step"]) if "global_step" in data else None
+    return scores, seen, epoch, global_step
+
+
 def collect_train_plr_state(vecenv, worker_states=None):
     if worker_states:
         merged = merge_sampler_states(worker_states.values())
