@@ -2,12 +2,19 @@ from collections import Counter
 
 SUCCESS_SOLVED = 0.999
 MANY_FAIL_RETURN = 0.0
-STRUCTURE_CATEGORIES = ("solved", "localized_failure", "globally_difficult", "many_fail")
+STRUCTURE_CATEGORIES = ("solved", "localized_failure", "globally_suboptimal", "many_fail")
 MAX_LOCALIZED_CARS = 1
+# Training-time (map, agent) fail EMA: one car owns this much of the fail mass.
+FAIL_STRUCTURAL_TOP1 = 0.8
+# Worst-car collision EMA at or above this → the leftover fail is a crash, else DNF.
+FAIL_COLLISION_EMA = 0.5
+# Mean collision/off-road steps on completed episodes for the worst car.
+FAIL_MULTI_HIT = 2.0
+MIN_OUTCOME_EPISODES = 2
 # Ties when pooling seeds: catastrophe > spread > one-car > solved.
 _STRUCTURE_SEVERITY = {
     "many_fail": 0,
-    "globally_difficult": 1,
+    "globally_suboptimal": 1,
     "localized_failure": 2,
     "solved": 3,
 }
@@ -43,7 +50,7 @@ def classify_structure(
         pass
     if failed_n <= int(max_localized_cars):
         return "localized_failure"
-    return "globally_difficult"
+    return "globally_suboptimal"
 
 
 def majority_structure(categories):

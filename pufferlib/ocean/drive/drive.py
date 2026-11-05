@@ -150,8 +150,7 @@ class Drive(pufferlib.PufferEnv):
             elif self.map_score in ("learnability", "learnability_hard"):
                 self._plr_successes = []
                 self._plr_dones = []
-                if self.map_score == "learnability_hard":
-                    self._plr_unsafe = []
+                self._plr_unsafe = []
         self.reward_vehicle_collision = reward_vehicle_collision
         self.reward_offroad_collision = reward_offroad_collision
         self.reward_goal = reward_goal
@@ -490,8 +489,7 @@ class Drive(pufferlib.PufferEnv):
             rewards = np.asarray(self.rewards)
             self._plr_successes.append((rewards > 0).astype(np.float32).copy())
             self._plr_dones.append(dones.copy())
-            if self._plr_unsafe is not None:
-                self._plr_unsafe.append((rewards < 0).astype(np.float32).copy())
+            self._plr_unsafe.append((rewards < 0).astype(np.float32).copy())
             return
         if self._plr_value_buf is not None:
             values = np.asarray(self._plr_value_buf, dtype=np.float32).reshape(-1)
@@ -628,6 +626,10 @@ class Drive(pufferlib.PufferEnv):
             "_plr_worker": int(os.getpid()),
             "_plr_scores": np.asarray(sampler.scores, dtype=np.float64).copy(),
             "_plr_seen": np.asarray(sampler.seen, dtype=bool).copy(),
+            "_plr_fail_ema": np.asarray(sampler.fail_ema, dtype=np.float32).copy(),
+            "_plr_coll_ema": np.asarray(sampler.coll_ema, dtype=np.float32).copy(),
+            "_plr_hit_ema": np.asarray(sampler.hit_ema, dtype=np.float32).copy(),
+            "_plr_outcome_n": np.asarray(sampler.outcome_n, dtype=np.float32).copy(),
         }
 
     def get_global_agent_state(self):

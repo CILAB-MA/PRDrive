@@ -16,11 +16,19 @@ import pufferlib
 # WOSAC eval
 from pufferlib.ocean.benchmark import metrics
 from pufferlib.ocean.benchmark import estimators
-from pufferlib.ocean.drive.level_sampler import merge_sampler_states, score_replay_weights
+from pufferlib.ocean.drive.level_sampler import (
+    fail_top1_share,
+    fail_worst_stat,
+    merge_sampler_states,
+    score_replay_weights,
+)
 from pufferlib.ocean.benchmark.structure import (
+    FAIL_COLLISION_EMA,
+    FAIL_MULTI_HIT,
+    FAIL_STRUCTURAL_TOP1,
+    MIN_OUTCOME_EPISODES,
     STRUCTURE_CATEGORIES,
     classify_structure,
-    failed_cars,
 )
 
 
@@ -862,51 +870,115 @@ def structure_scalars(logs, prefix="analyze/structure"):
         if log and float(log.get("n", 0) or 0) > 0 and "score" in log and "_plr_scores" not in log
     ]
     map_categories = {}
-    rows = []
+    counts = {cat: 0 for cat in STRUCTURE_CATEGORIES}
     for log in populated:
         cat = classify_structure(log)
-        n = float(log["n"])
-        failed = failed_cars(log)
-        score = float(log["score"])
-        ep_ret = float(log["episode_return"]) if "episode_return" in log else None
-        map_id = int(log["map_id"]) if "map_id" in log else -1
-        rows.append((cat, n, failed, score, ep_ret, map_id))
-        if map_id >= 0:
-            map_categories[map_id] = cat
+        counts[cat] += 1
+        if "map_id" in log:
+            map_categories[int(log["map_id"])] = cat
 
-    stats = {f"{prefix}/{cat}_n": 0.0 for cat in STRUCTURE_CATEGORIES}
-    if not rows:
-        return stats, map_categories
-
-    total_n = sum(row[1] for row in rows)
-    total_failed = sum(row[2] for row in rows)
-    n_scen = float(len(rows))
+    n_scen = float(len(populated))
+    stats = {f"{prefix}/{cat}_n": float(counts[cat]) for cat in STRUCTURE_CATEGORIES}
     stats[f"{prefix}/maps"] = n_scen
-    stats[f"{prefix}/failed_cars"] = float(total_failed)
-    stats[f"{prefix}/mean_score"] = float(sum(row[3] * row[1] for row in rows) / total_n) if total_n else 0.0
-    rets = [(row[4], row[1]) for row in rows if row[4] is not None]
-    if rets:
-        stats[f"{prefix}/mean_return"] = float(sum(r * n for r, n in rets) / sum(n for _, n in rets))
-
-    for cat in STRUCTURE_CATEGORIES:
-        part = [row for row in rows if row[0] == cat]
-        stats[f"{prefix}/{cat}_n"] = float(len(part))
-        stats[f"{prefix}/{cat}_share"] = float(len(part) / n_scen)
-        failed = sum(row[2] for row in part)
-        stats[f"{prefix}/{cat}_failed_cars"] = float(failed)
-        stats[f"{prefix}/{cat}_failed_share"] = float(failed / total_failed) if total_failed > 0 else 0.0
-        if not part:
-            continue
-        pn = sum(row[1] for row in part)
-        stats[f"{prefix}/{cat}_mean_score"] = float(sum(row[3] * row[1] for row in part) / pn) if pn else 0.0
-        stats[f"{prefix}/{cat}_mean_n"] = float(pn / len(part))
-        stats[f"{prefix}/{cat}_mean_failed"] = float(sum(row[2] for row in part) / len(part))
-        part_rets = [(row[4], row[1]) for row in part if row[4] is not None]
-        if part_rets:
-            stats[f"{prefix}/{cat}_mean_return"] = float(
-                sum(r * n for r, n in part_rets) / sum(n for _, n in part_rets)
-            )
+    if n_scen:
+        for cat in STRUCTURE_CATEGORIES:
+            stats[f"{prefix}/{cat}_share"] = float(counts[cat] / n_scen)
     return stats, map_categories
+
+
+def unpack_plr_state(plr_state):
+    """Accept (scores, seen), an outcomes tuple, or a dict."""
+    if plr_state is None:
+        return None
+    if isinstance(plr_state, dict):
+        return {
+            "scores": plr_state.get("scores"),
+            "seen": plr_state.get("seen"),
+            "fail_ema": plr_state.get("fail_ema"),
+            "coll_ema": plr_state.get("coll_ema"),
+            "hit_ema": plr_state.get("hit_ema"),
+            "outcome_n": plr_state.get("outcome_n"),
+        }
+    scores, seen = plr_state[0], plr_state[1]
+    fail = coll = hits = n = None
+    if len(plr_state) >= 6:
+        fail, coll, hits, n = plr_state[2], plr_state[3], plr_state[4], plr_state[5]
+    elif len(plr_state) >= 5:
+        fail, coll, n = plr_state[2], plr_state[3], plr_state[4]
+    return {
+        "scores": scores,
+        "seen": seen,
+        "fail_ema": fail,
+        "coll_ema": coll,
+        "hit_ema": hits,
+        "outcome_n": n,
+    }
+
+
+def _lf_outcome_scalars(map_ids, categories, packed, prefix):
+    fail_ema = packed.get("fail_ema")
+    coll_ema = packed.get("coll_ema")
+    outcome_n = packed.get("outcome_n")
+    if fail_ema is None or coll_ema is None or outcome_n is None:
+        return {}
+    fail_ema = np.asarray(fail_ema, dtype=np.float64)
+    coll_ema = np.asarray(coll_ema, dtype=np.float64)
+    outcome_n = np.asarray(outcome_n, dtype=np.float64)
+    hit_ema = packed.get("hit_ema")
+    hit_ema = np.zeros_like(fail_ema) if hit_ema is None else np.asarray(hit_ema, dtype=np.float64)
+    if fail_ema.ndim != 2 or fail_ema.shape != coll_ema.shape or fail_ema.shape != outcome_n.shape:
+        return {}
+    if hit_ema.shape != fail_ema.shape:
+        hit_ema = np.zeros_like(fail_ema)
+    n_maps = fail_ema.shape[0]
+    structural = oneoff = crash = dnf = multi = 0
+    top1s = []
+    worst_hits = []
+    for map_id, cat in zip(map_ids, categories):
+        if cat != "localized_failure":
+            continue
+        idx = int(map_id)
+        if idx < 0 or idx >= n_maps:
+            continue
+        top1 = fail_top1_share(fail_ema[idx], outcome_n[idx], min_episodes=MIN_OUTCOME_EPISODES)
+        if top1 is None:
+            continue
+        top1s.append(top1)
+        if top1 >= FAIL_STRUCTURAL_TOP1:
+            structural += 1
+        else:
+            oneoff += 1
+        worst_coll = fail_worst_stat(
+            fail_ema[idx], coll_ema[idx], outcome_n[idx], min_episodes=MIN_OUTCOME_EPISODES
+        )
+        if worst_coll is None:
+            continue
+        if worst_coll >= FAIL_COLLISION_EMA:
+            crash += 1
+        else:
+            dnf += 1
+        hits = fail_worst_stat(
+            fail_ema[idx], hit_ema[idx], outcome_n[idx], min_episodes=MIN_OUTCOME_EPISODES
+        )
+        if hits is None:
+            continue
+        worst_hits.append(hits)
+        if hits >= FAIL_MULTI_HIT:
+            multi += 1
+    n_out = float(len(top1s))
+    n_mode = float(crash + dnf)
+    n_hit = float(len(worst_hits))
+    stats = {
+        f"{prefix}/lf_outcomes_n": n_out,
+        f"{prefix}/lf_structural_share": float(structural / n_out) if n_out else 0.0,
+        f"{prefix}/lf_oneoff_share": float(oneoff / n_out) if n_out else 0.0,
+        f"{prefix}/lf_mean_top1": float(np.mean(top1s)) if top1s else 0.0,
+        f"{prefix}/lf_fail_is_collision": float(crash / n_mode) if n_mode else 0.0,
+        f"{prefix}/lf_fail_is_dnf": float(dnf / n_mode) if n_mode else 0.0,
+        f"{prefix}/lf_worst_hits": float(np.mean(worst_hits)) if worst_hits else 0.0,
+        f"{prefix}/lf_multi_hit_share": float(multi / n_hit) if n_hit else 0.0,
+    }
+    return stats
 
 
 def analyze_scalars(logs, plr_state=None, prefix="analyze", map_score="max_mc"):
@@ -933,9 +1005,9 @@ def analyze_scalars(logs, plr_state=None, prefix="analyze", map_score="max_mc"):
             stats[f"{prefix}/{lens}/rate"] = float(sum(r * n for r, n in zip(rates, ns)) / nsum)
     if plr_state is None or not map_categories:
         return stats
-    scores, seen = plr_state
-    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
-    seen = np.asarray(seen, dtype=bool).reshape(-1)
+    packed = unpack_plr_state(plr_state)
+    scores = np.asarray(packed["scores"], dtype=np.float64).reshape(-1)
+    seen = np.asarray(packed["seen"], dtype=bool).reshape(-1)
     ids = np.fromiter(map_categories.keys(), dtype=np.int64)
     ids = ids[(ids >= 0) & (ids < scores.shape[0])]
     if ids.size == 0:
@@ -943,7 +1015,6 @@ def analyze_scalars(logs, plr_state=None, prefix="analyze", map_score="max_mc"):
     struct = f"{prefix}/structure"
     cats = np.array([map_categories[int(i)] for i in ids])
     window_seen = seen[ids]
-    stats[f"{struct}/plr_seen_frac"] = float(window_seen.mean())
     score_name = str(map_score or "max_mc").lower().replace("-", "_")
     weights = score_replay_weights(
         scores, seen, invert_scores=score_name in ("return", "episode_return")
@@ -956,6 +1027,7 @@ def analyze_scalars(logs, plr_state=None, prefix="analyze", map_score="max_mc"):
         stats[f"{struct}/plr_weight_{cat}"] = (
             float(weights[ids[mask]].sum() / denom) if denom > 0 and mask.any() else 0.0
         )
+    stats.update(_lf_outcome_scalars(ids, cats, packed, struct))
     return stats
 
 
@@ -973,9 +1045,9 @@ def score_tail_map_ids(plr_state, k, map_dir, num_maps, tail=None, map_score="ma
         name = str(map_score or "max_mc").lower().replace("-", "_")
         tail = "low" if name in ("return", "episode_return") else "high"
     if plr_state is not None:
-        scores, seen = plr_state
-        scores = np.asarray(scores, dtype=np.float64).reshape(-1)
-        seen = np.asarray(seen, dtype=bool).reshape(-1)
+        packed = unpack_plr_state(plr_state)
+        scores = np.asarray(packed["scores"], dtype=np.float64).reshape(-1)
+        seen = np.asarray(packed["seen"], dtype=bool).reshape(-1)
         ids = np.flatnonzero(seen[: min(scores.shape[0], seen.shape[0])])
         if counts is not None:
             counts = np.asarray(counts)
@@ -1003,9 +1075,9 @@ def tail_rank_scalars(map_ids, plr_state=None, prefix="analyze/lowk"):
     stats = {f"{prefix}/k": float(map_ids.size)}
     if plr_state is None or map_ids.size == 0:
         return stats
-    scores, seen = plr_state
-    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
-    seen = np.asarray(seen, dtype=bool).reshape(-1)
+    packed = unpack_plr_state(plr_state)
+    scores = np.asarray(packed["scores"], dtype=np.float64).reshape(-1)
+    seen = np.asarray(packed["seen"], dtype=bool).reshape(-1)
     stats[f"{prefix}/seen_n"] = float(seen.sum())
     in_range = (map_ids >= 0) & (map_ids < scores.shape[0])
     ids = map_ids[in_range]
@@ -1037,15 +1109,21 @@ def agents_for_map_ids(map_dir, map_ids, num_maps):
 def save_plr_state(path, plr_state, epoch=None, global_step=None):
     if plr_state is None:
         return None
-    scores, seen = plr_state
+    packed = unpack_plr_state(plr_state)
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    np.savez_compressed(
-        path,
-        scores=np.asarray(scores, dtype=np.float64),
-        seen=np.asarray(seen, dtype=bool),
-        epoch=np.int64(-1 if epoch is None else epoch),
-        global_step=np.int64(-1 if global_step is None else global_step),
-    )
+    payload = {
+        "scores": np.asarray(packed["scores"], dtype=np.float64),
+        "seen": np.asarray(packed["seen"], dtype=bool),
+        "epoch": np.int64(-1 if epoch is None else epoch),
+        "global_step": np.int64(-1 if global_step is None else global_step),
+    }
+    if packed.get("fail_ema") is not None:
+        payload["fail_ema"] = np.asarray(packed["fail_ema"], dtype=np.float64)
+        payload["coll_ema"] = np.asarray(packed["coll_ema"], dtype=np.float64)
+        payload["outcome_n"] = np.asarray(packed["outcome_n"], dtype=np.float64)
+        if packed.get("hit_ema") is not None:
+            payload["hit_ema"] = np.asarray(packed["hit_ema"], dtype=np.float64)
+    np.savez_compressed(path, **payload)
     return path
 
 
@@ -1058,11 +1136,30 @@ def load_plr_state(path):
     return scores, seen, epoch, global_step
 
 
+def _sampler_state_dict(sampler):
+    return {
+        "scores": sampler.scores,
+        "seen": sampler.seen,
+        "fail_ema": sampler.fail_ema,
+        "coll_ema": sampler.coll_ema,
+        "hit_ema": sampler.hit_ema,
+        "outcome_n": sampler.outcome_n,
+    }
+
+
+def _as_plr_dict(merged):
+    if merged is None:
+        return None
+    if isinstance(merged, dict):
+        return merged
+    return {"scores": merged[0], "seen": merged[1]}
+
+
 def collect_train_plr_state(vecenv, worker_states=None):
     if worker_states:
         merged = merge_sampler_states(worker_states.values())
         if merged is not None:
-            return merged
+            return _as_plr_dict(merged)
     samplers = []
     envs = getattr(vecenv, "envs", None)
     if envs:
@@ -1074,7 +1171,7 @@ def collect_train_plr_state(vecenv, worker_states=None):
             samplers = [sampler]
     if not samplers:
         return None
-    return merge_sampler_states([(s.scores, s.seen) for s in samplers])
+    return _as_plr_dict(merge_sampler_states([_sampler_state_dict(s) for s in samplers]))
 
 
 class Evaluator:
@@ -1098,7 +1195,8 @@ class Evaluator:
     def __init__(self, configs, logger=None, map_id_queue=None):
         self.configs = configs
         self.logger = logger
-        self.sim_steps = 90
+        # Match the training C horizon so timeout maps still call add_log.
+        self.sim_steps = int(configs["env"].get("episode_length") or 110)
         self.self_play_stats = None
         self.human_replay_stats = None
         self.sp_env = None
@@ -1121,7 +1219,7 @@ class Evaluator:
         eval_config["env"]["map_dir"] = eval_config["eval"]["map_dir"]
         eval_config["env"]["num_maps"] = 200  # Interactive validation set
         eval_config["env"]["num_agents"] = eval_config["eval"]["num_eval_agents"]
-        eval_config["env"]["episode_length"] = 130
+        eval_config["env"]["episode_length"] = int(self.sim_steps)
         eval_config["vec"] = dict(backend=backend, num_envs=1)
         eval_config["env"]["fix_lambdas"] = True
         eval_config["env"]["fix_rewards"] = True  # Fix to the ini file ones for all agents

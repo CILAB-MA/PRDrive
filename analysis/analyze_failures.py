@@ -1,4 +1,4 @@
-"""Are failures localized (1 car) or globally-difficult (2+ cars)?
+"""Are failures localized (1 car) or globally-suboptimal (2+ cars)?
 
 Reads the per-map JSONL files written by eval_per_scenario.py (drive.py eval_map_log_path).
 Each line = one read of one map's log: rates are averages over that map's car-episodes,
@@ -43,7 +43,7 @@ ap.add_argument(
     "--max-localized-cars",
     type=int,
     default=MAX_LOCALIZED_CARS,
-    help="Complete car-fails at or below this count are localized_failure; above is globally_difficult. return<0 is many_fail first.",
+    help="Complete car-fails at or below this count are localized_failure; above is globally_suboptimal. return<0 is many_fail first.",
 )
 ap.add_argument("--min-n", type=float, default=1, help="Ignore maps with fewer cars (summed over reads) than this")
 a = ap.parse_args()
@@ -134,7 +134,7 @@ summary.to_csv(os.path.join(out_dir, "summary.csv"))
 colors = {
     "solved": "tab:green",
     "localized_failure": "tab:orange",
-    "globally_difficult": "tab:cyan",
+    "globally_suboptimal": "tab:cyan",
     "many_fail": "tab:red",
 }
 fig, ax = plt.subplots(1, 3, figsize=(17, 4.8))

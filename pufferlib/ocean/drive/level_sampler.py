@@ -22,6 +22,7 @@ class LevelSampler:
         gae_lambda=0.95,  # GAE lambda used when PVL builds advantages from a stored rollout
         max_controlled_agents=32,  # per-vehicle MaxMC R_max slots, matching Drive max_controlled_agents
         invert_scores=False,  # if True, rank low stored scores first (episode return)
+        outcome_alpha=0.2,  # EMA for per-vehicle fail/collision rates (score alpha is often 1)
     ):
         if strategy not in ("prioritized", "uniform", "sequential"):
             raise ValueError(
@@ -55,6 +56,9 @@ class LevelSampler:
         if self.max_controlled_agents < 1:
             raise ValueError("max_controlled_agents must be >= 1")
         self.invert_scores = bool(invert_scores)
+        self.outcome_alpha = float(outcome_alpha)
+        if not (0.0 < self.outcome_alpha <= 1.0):
+            raise ValueError(f"outcome_alpha must be in (0, 1], got {outcome_alpha!r}")
         self._rng = np.random.default_rng(seed)
 
         # Per-map state.
@@ -65,6 +69,11 @@ class LevelSampler:
         # C caps controllable agents at MAX_AGENTS=32; training npy max is also 32.
         self.max_returns = np.zeros((self.num_maps, self.max_controlled_agents), dtype=np.float64)
         self.max_return_valid = np.zeros((self.num_maps, self.max_controlled_agents), dtype=bool)
+        # Per-vehicle fail / collision EMA. Slot index is the map's controllable order.
+        self.fail_ema = np.zeros((self.num_maps, self.max_controlled_agents), dtype=np.float64)
+        self.coll_ema = np.zeros((self.num_maps, self.max_controlled_agents), dtype=np.float64)
+        self.hit_ema = np.zeros((self.num_maps, self.max_controlled_agents), dtype=np.float64)
+        self.outcome_n = np.zeros((self.num_maps, self.max_controlled_agents), dtype=np.float64)
         self._next_index = 0
 
     # ---- weighting -------------------------------------------------
@@ -325,38 +334,147 @@ class LevelSampler:
                     "MaxMC scores can be negative, so score_transform must be 'rank'. "
                     f"Got: {self.score_transform!r}"
                 )
-            return self.score_max_mc(map_id, rewards, values, dones)
+            reduced = self.score_max_mc(map_id, rewards, values, dones)
+            self.update_agent_outcomes(map_id, rewards=rewards, dones=dones)
+            return reduced
         if name == "pvl":
             if advantages is None:
-                return self.score_pvl_rollout(
+                reduced = self.score_pvl_rollout(
                     map_id, rewards, values, dones, bootstrap_values=bootstrap_values
                 )
-            return self.score_pvl(map_id, advantages, dones)
+            else:
+                reduced = self.score_pvl(map_id, advantages, dones)
+            if rewards is not None and dones is not None:
+                self.update_agent_outcomes(map_id, rewards=rewards, dones=dones)
+            return reduced
         if name == "learnability":
-            return self.score_learnability(map_id, successes, dones, unsafe=None)
+            reduced = self.score_learnability(map_id, successes, dones, unsafe=None)
+            self.update_agent_outcomes(map_id, successes=successes, dones=dones, unsafe=unsafe)
+            return reduced
         if name == "learnability_hard":
-            return self.score_learnability(map_id, successes, dones, unsafe=unsafe)
+            reduced = self.score_learnability(map_id, successes, dones, unsafe=unsafe)
+            self.update_agent_outcomes(map_id, successes=successes, dones=dones, unsafe=unsafe)
+            return reduced
         raise ValueError(f"Unknown score function: {score_function!r}")
+
+    def update_agent_outcomes(self, map_id, successes=None, dones=None, unsafe=None, rewards=None):
+        """EMA of per-vehicle fail, collision, and hit-count on completed episodes.
+
+        Open resample tails are ignored. Fail is 1 if the finished episode did
+        not score (no goal, or unsafe when given). Collision is 1 if unsafe
+        fired. Hits are unsafe steps in that episode. ``rewards > 0`` is goal
+        and ``rewards < 0`` is unsafe when only rewards are passed.
+        """
+        if dones is None:
+            return
+        if successes is None:
+            if rewards is None:
+                return
+            rewards = np.asarray(rewards)
+            successes = (rewards > 0).astype(np.float64)
+            if unsafe is None:
+                unsafe = (rewards < 0).astype(np.float64)
+        fail_rate, coll_rate, hit_mean, n_ep = compute_agent_outcomes(successes, dones, unsafe)
+        map_id = int(map_id)
+        n_store = min(int(fail_rate.shape[0]), self.fail_ema.shape[1])
+        alpha = self.outcome_alpha
+        for agent in range(n_store):
+            visits = float(n_ep[agent])
+            if visits <= 0:
+                continue
+            if self.outcome_n[map_id, agent] <= 0:
+                self.fail_ema[map_id, agent] = float(fail_rate[agent])
+                self.coll_ema[map_id, agent] = float(coll_rate[agent])
+                self.hit_ema[map_id, agent] = float(hit_mean[agent])
+            else:
+                self.fail_ema[map_id, agent] = (1.0 - alpha) * self.fail_ema[map_id, agent] + alpha * float(
+                    fail_rate[agent]
+                )
+                self.coll_ema[map_id, agent] = (1.0 - alpha) * self.coll_ema[map_id, agent] + alpha * float(
+                    coll_rate[agent]
+                )
+                self.hit_ema[map_id, agent] = (1.0 - alpha) * self.hit_ema[map_id, agent] + alpha * float(
+                    hit_mean[agent]
+                )
+            self.outcome_n[map_id, agent] += visits
+
+
+def _split_sampler_state(state):
+    if isinstance(state, dict):
+        return (
+            state["scores"],
+            state["seen"],
+            state.get("fail_ema"),
+            state.get("coll_ema"),
+            state.get("hit_ema"),
+            state.get("outcome_n"),
+        )
+    scores, seen = state[0], state[1]
+    if len(state) >= 6:
+        return scores, seen, state[2], state[3], state[4], state[5]
+    if len(state) >= 5:
+        return scores, seen, state[2], state[3], None, state[4]
+    return scores, seen, None, None, None, None
 
 
 def merge_sampler_states(states):
     states = list(states)
     if not states:
         return None
-    num_maps = int(np.asarray(states[0][0]).shape[0])
+    first = _split_sampler_state(states[0])
+    num_maps = int(np.asarray(first[0]).shape[0])
     score_sum = np.zeros(num_maps, dtype=np.float64)
     seen_count = np.zeros(num_maps, dtype=np.float64)
-    for scores, seen in states:
+    fail_sum = coll_sum = hit_sum = n_sum = None
+    n_agents = None
+    for state in states:
+        scores, seen, fail_ema, coll_ema, hit_ema, outcome_n = _split_sampler_state(state)
         scores = np.asarray(scores, dtype=np.float64).reshape(-1)
         seen = np.asarray(seen, dtype=bool).reshape(-1)
         if scores.shape[0] != num_maps or seen.shape[0] != num_maps:
             raise ValueError("all sampler states must have the same num_maps")
         score_sum += np.where(seen, scores, 0.0)
         seen_count += seen.astype(np.float64)
+        if fail_ema is None or coll_ema is None or outcome_n is None:
+            continue
+        fail_ema = np.asarray(fail_ema, dtype=np.float64)
+        coll_ema = np.asarray(coll_ema, dtype=np.float64)
+        outcome_n = np.asarray(outcome_n, dtype=np.float64)
+        if hit_ema is None:
+            hit_ema = np.zeros_like(fail_ema)
+        else:
+            hit_ema = np.asarray(hit_ema, dtype=np.float64)
+        if fail_ema.shape != coll_ema.shape or fail_ema.shape != outcome_n.shape or fail_ema.shape != hit_ema.shape:
+            raise ValueError("fail_ema, coll_ema, hit_ema, and outcome_n must match")
+        if fail_sum is None:
+            n_agents = fail_ema.shape[1] if fail_ema.ndim == 2 else 1
+            fail_sum = np.zeros((num_maps, n_agents), dtype=np.float64)
+            coll_sum = np.zeros_like(fail_sum)
+            hit_sum = np.zeros_like(fail_sum)
+            n_sum = np.zeros_like(fail_sum)
+        fail_sum += fail_ema * outcome_n
+        coll_sum += coll_ema * outcome_n
+        hit_sum += hit_ema * outcome_n
+        n_sum += outcome_n
     merged_seen = seen_count > 0
     merged_scores = np.zeros(num_maps, dtype=np.float64)
     np.divide(score_sum, seen_count, out=merged_scores, where=merged_seen)
-    return merged_scores, merged_seen
+    if fail_sum is None:
+        return merged_scores, merged_seen
+    merged_fail = np.zeros_like(fail_sum)
+    merged_coll = np.zeros_like(coll_sum)
+    merged_hit = np.zeros_like(hit_sum)
+    np.divide(fail_sum, n_sum, out=merged_fail, where=n_sum > 0)
+    np.divide(coll_sum, n_sum, out=merged_coll, where=n_sum > 0)
+    np.divide(hit_sum, n_sum, out=merged_hit, where=n_sum > 0)
+    return {
+        "scores": merged_scores,
+        "seen": merged_seen,
+        "fail_ema": merged_fail,
+        "coll_ema": merged_coll,
+        "hit_ema": merged_hit,
+        "outcome_n": n_sum,
+    }
 
 
 def score_replay_weights(
@@ -444,13 +562,29 @@ def _broadcast_agent_max_return(max_return, n_agents):
     return out
 
 
-def compute_agent_max_mc(rewards, values, dones, max_return, gamma=0.99):
-    """Per-agent MaxMC. Returns (agent_scores, updated_max_return).
+def episode_live_mask(dones):
+    """Skip Drive re-asserting ``terminals=1`` after a car already finished.
 
-    ``max_return`` is a scalar or (A,) best episodic return per vehicle.
-    Each vehicle uses its own discounted \(R_{\max}^{\theta,n}\),
-    \(R_n=\sum_t \gamma^t r_{n,t}\), not a shared map max.
+    Returns ``(live, finish)`` bool arrays shaped like 2d ``dones``. ``live``
+    is an in-progress episode, including its first done. ``finish`` is that
+    first done. Open tails are live with no finish. Consecutive terminals
+    after a finish are neither.
     """
+    done = np.asarray(dones) > 0
+    timesteps, agents = done.shape
+    live = np.empty((timesteps, agents), dtype=bool)
+    finish = np.empty((timesteps, agents), dtype=bool)
+    prev_done = np.zeros(agents, dtype=bool)
+    for t in range(timesteps):
+        is_done = done[t]
+        step_live = ~(prev_done & is_done)
+        live[t] = step_live
+        finish[t] = is_done & step_live
+        prev_done = is_done
+    return live, finish
+
+
+def compute_agent_max_mc(rewards, values, dones, max_return, gamma=0.99):
     rewards = np.asarray(rewards, dtype=np.float64)
     values = np.asarray(values, dtype=np.float64)
     dones = np.asarray(dones, dtype=np.float64)
@@ -465,18 +599,18 @@ def compute_agent_max_mc(rewards, values, dones, max_return, gamma=0.99):
         return np.zeros(0, dtype=np.float64), prev
 
     timesteps, agents = rewards.shape
+    live, finish = episode_live_mask(dones)
     prev = _broadcast_agent_max_return(max_return, agents)
     gamma = float(gamma)
     partial_return = np.zeros(agents, dtype=np.float64)
     discount = np.ones(agents, dtype=np.float64)
     max_ep_return = np.full(agents, -np.inf, dtype=np.float64)
     for t in range(timesteps):
-        partial_return += discount * rewards[t]
-        discount *= gamma
-        done = dones[t] > 0
-        max_ep_return = np.where(done, np.maximum(max_ep_return, partial_return), max_ep_return)
-        partial_return = np.where(done, 0.0, partial_return)
-        discount = np.where(done, 1.0, discount)
+        partial_return = np.where(live[t], partial_return + discount * rewards[t], partial_return)
+        discount = np.where(live[t], discount * gamma, discount)
+        max_ep_return = np.where(finish[t], np.maximum(max_ep_return, partial_return), max_ep_return)
+        partial_return = np.where(finish[t], 0.0, partial_return)
+        discount = np.where(finish[t], 1.0, discount)
     # Unfinished tail still counts as an episode return.
     max_ep_return = np.where(np.isfinite(max_ep_return), max_ep_return, partial_return)
     agent_max = np.maximum(prev, max_ep_return)
@@ -486,13 +620,12 @@ def compute_agent_max_mc(rewards, values, dones, max_return, gamma=0.99):
     sum_ep_gap = np.zeros(agents, dtype=np.float64)
     n_episodes = np.zeros(agents, dtype=np.float64)
     for t in range(timesteps):
-        partial_gap += agent_max - values[t]
-        partial_steps += 1.0
-        done = dones[t] > 0
-        sum_ep_gap += np.where(done, partial_gap / partial_steps, 0.0)
-        n_episodes += done
-        partial_gap = np.where(done, 0.0, partial_gap)
-        partial_steps = np.where(done, 0.0, partial_steps)
+        partial_gap = np.where(live[t], partial_gap + (agent_max - values[t]), partial_gap)
+        partial_steps = np.where(live[t], partial_steps + 1.0, partial_steps)
+        sum_ep_gap = np.where(finish[t], sum_ep_gap + partial_gap / np.maximum(partial_steps, 1.0), sum_ep_gap)
+        n_episodes = np.where(finish[t], n_episodes + 1.0, n_episodes)
+        partial_gap = np.where(finish[t], 0.0, partial_gap)
+        partial_steps = np.where(finish[t], 0.0, partial_steps)
     open_tail = partial_steps > 0
     tail_gap = np.divide(partial_gap, partial_steps, out=np.zeros_like(partial_gap), where=open_tail)
     sum_ep_gap = np.where(open_tail, sum_ep_gap + tail_gap, sum_ep_gap)
@@ -537,6 +670,7 @@ def compute_gae(rewards, values, dones, gamma=0.99, gae_lambda=0.95, bootstrap_v
         return np.zeros((0, 0), dtype=np.float64) if not squeeze else np.zeros(0, dtype=np.float64)
 
     timesteps, agents = rewards.shape
+    live, finish = episode_live_mask(dones)
     advantages = np.zeros((timesteps, agents), dtype=np.float64)
     lastgaelam = np.zeros(agents, dtype=np.float64)
     gamma = float(gamma)
@@ -548,11 +682,12 @@ def compute_gae(rewards, values, dones, gamma=0.99, gae_lambda=0.95, bootstrap_v
         if bootstrap.shape[0] != agents:
             raise ValueError("bootstrap_values must have one value per agent")
     for t in range(timesteps - 1, -1, -1):
-        nonterminal = 1.0 - (dones[t] > 0).astype(np.float64)
+        nonterminal = (~finish[t]).astype(np.float64)
         next_v = values[t + 1] if t + 1 < timesteps else bootstrap
         delta = rewards[t] + gamma * next_v * nonterminal - values[t]
-        lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
-        advantages[t] = lastgaelam
+        new_lam = delta + gamma * lam * nonterminal * lastgaelam
+        lastgaelam = np.where(live[t], new_lam, lastgaelam)
+        advantages[t] = np.where(live[t], lastgaelam, 0.0)
     if squeeze:
         return advantages[:, 0]
     return advantages
@@ -572,18 +707,18 @@ def compute_agent_pvl(advantages, dones):
 
     pos = np.maximum(advantages, 0.0)
     timesteps, agents = pos.shape
+    live, finish = episode_live_mask(dones)
     partial_sum = np.zeros(agents, dtype=np.float64)
     partial_steps = np.zeros(agents, dtype=np.float64)
     sum_ep = np.zeros(agents, dtype=np.float64)
     n_episodes = np.zeros(agents, dtype=np.float64)
     for t in range(timesteps):
-        partial_sum += pos[t]
-        partial_steps += 1.0
-        done = dones[t] > 0
-        sum_ep += np.where(done, partial_sum / partial_steps, 0.0)
-        n_episodes += done
-        partial_sum = np.where(done, 0.0, partial_sum)
-        partial_steps = np.where(done, 0.0, partial_steps)
+        partial_sum = np.where(live[t], partial_sum + pos[t], partial_sum)
+        partial_steps = np.where(live[t], partial_steps + 1.0, partial_steps)
+        sum_ep = np.where(finish[t], sum_ep + partial_sum / np.maximum(partial_steps, 1.0), sum_ep)
+        n_episodes = np.where(finish[t], n_episodes + 1.0, n_episodes)
+        partial_sum = np.where(finish[t], 0.0, partial_sum)
+        partial_steps = np.where(finish[t], 0.0, partial_steps)
     open_tail = partial_steps > 0
     tail = np.divide(partial_sum, partial_steps, out=np.zeros_like(partial_sum), where=open_tail)
     sum_ep = np.where(open_tail, sum_ep + tail, sum_ep)
@@ -597,13 +732,109 @@ def compute_pvl(advantages, dones, score_aggregate="mean"):
     return aggregate_agent_scores(compute_agent_pvl(advantages, dones), score_aggregate)
 
 
+def compute_agent_outcomes(successes, dones, unsafe=None):
+    """Per-agent fail, collision, and hit counts over **completed** episodes.
+
+    A life starts on a non-done step (or the first done after a live stretch).
+    Consecutive terminals after a car already finished — Drive re-asserts
+    ``terminals=1`` until the map resets — are skipped. Open resample tails
+    never get a done, so they are ignored.
+
+    Fail is 1 if a finished episode did not score (no goal, or ``unsafe``
+    fired). Collision is 1 if ``unsafe`` fired. Hits are unsafe steps in that
+    episode. Returns ``(fail_rate, coll_rate, hit_mean, n_episodes)``.
+    """
+    successes = np.asarray(successes, dtype=np.float64)
+    dones = np.asarray(dones, dtype=np.float64)
+    if successes.ndim == 1:
+        successes = successes[:, None]
+        dones = dones[:, None]
+        if unsafe is not None:
+            unsafe = np.asarray(unsafe, dtype=np.float64)[:, None]
+    if successes.shape != dones.shape:
+        raise ValueError("successes and dones must have the same shape")
+    if unsafe is not None:
+        unsafe = np.asarray(unsafe, dtype=np.float64)
+        if unsafe.shape != successes.shape:
+            raise ValueError("unsafe must have the same shape as successes")
+
+    live, finish = episode_live_mask(dones)
+    _, agents = successes.shape
+    partial_goal = np.zeros(agents, dtype=np.float64)
+    partial_unsafe = np.zeros(agents, dtype=np.float64)
+    partial_hits = np.zeros(agents, dtype=np.float64)
+    n_fail = np.zeros(agents, dtype=np.float64)
+    n_coll = np.zeros(agents, dtype=np.float64)
+    n_hits = np.zeros(agents, dtype=np.float64)
+    n_episodes = np.zeros(agents, dtype=np.float64)
+    for t in range(successes.shape[0]):
+        if unsafe is None:
+            step_unsafe = np.zeros(agents, dtype=np.float64)
+        else:
+            step_unsafe = (unsafe[t] > 0).astype(np.float64)
+        step_goal = (successes[t] > 0).astype(np.float64)
+        partial_goal = np.where(live[t], np.maximum(partial_goal, step_goal), partial_goal)
+        partial_unsafe = np.where(live[t], np.maximum(partial_unsafe, step_unsafe), partial_unsafe)
+        partial_hits = np.where(live[t], partial_hits + step_unsafe, partial_hits)
+        scored = partial_goal if unsafe is None else partial_goal * (1.0 - partial_unsafe)
+        n_fail += np.where(finish[t], 1.0 - scored, 0.0)
+        n_coll += np.where(finish[t], partial_unsafe, 0.0)
+        n_hits += np.where(finish[t], partial_hits, 0.0)
+        n_episodes += finish[t].astype(np.float64)
+        partial_goal = np.where(finish[t], 0.0, partial_goal)
+        partial_unsafe = np.where(finish[t], 0.0, partial_unsafe)
+        partial_hits = np.where(finish[t], 0.0, partial_hits)
+    fail_rate = np.divide(n_fail, n_episodes, out=np.zeros_like(n_fail), where=n_episodes > 0)
+    coll_rate = np.divide(n_coll, n_episodes, out=np.zeros_like(n_coll), where=n_episodes > 0)
+    hit_mean = np.divide(n_hits, n_episodes, out=np.zeros_like(n_hits), where=n_episodes > 0)
+    return fail_rate, coll_rate, hit_mean, n_episodes
+
+
+def fail_top1_share(fail_ema, outcome_n, min_episodes=2):
+    """Fraction of fail-mass on the worst vehicle. None if no slot has enough visits."""
+    fail = np.asarray(fail_ema, dtype=np.float64).reshape(-1)
+    visits = np.asarray(outcome_n, dtype=np.float64).reshape(-1)
+    if fail.shape[0] != visits.shape[0]:
+        raise ValueError("fail_ema and outcome_n must have the same length")
+    valid = visits >= float(min_episodes)
+    if not valid.any():
+        return None
+    mass = fail[valid]
+    total = float(mass.sum())
+    if total <= 0:
+        return 0.0
+    return float(mass.max() / total)
+
+
+def fail_worst_stat(fail_ema, stat_ema, outcome_n, min_episodes=2):
+    """``stat_ema`` of the vehicle that owns the most fail mass. None if unused."""
+    fail = np.asarray(fail_ema, dtype=np.float64).reshape(-1)
+    stat = np.asarray(stat_ema, dtype=np.float64).reshape(-1)
+    visits = np.asarray(outcome_n, dtype=np.float64).reshape(-1)
+    if fail.shape != stat.shape or fail.shape != visits.shape:
+        raise ValueError("fail_ema, stat_ema, and outcome_n must match")
+    valid = visits >= float(min_episodes)
+    if not valid.any():
+        return None
+    masked = np.where(valid, fail, -np.inf)
+    if not np.isfinite(masked).any() or float(fail[valid].sum()) <= 0:
+        return 0.0
+    return float(stat[int(np.argmax(masked))])
+
+
+def fail_worst_collision(fail_ema, coll_ema, outcome_n, min_episodes=2):
+    """Collision EMA of the vehicle that owns the most fail mass."""
+    return fail_worst_stat(fail_ema, coll_ema, outcome_n, min_episodes=min_episodes)
+
+
 def compute_learnability(successes, dones=None, unsafe=None):
     """Map learnability as mean over vehicles of p_n(1-p_n).
 
     successes: (T, A) flag that the agent reached its goal at that step, or a
         1d array of already-finished episode outcomes for one agent.
     dones: (T, A) optional episode ends. An episode succeeds if it saw a goal
-        hit at least once. Unfinished tails count, same as MaxMC.
+        hit at least once. Repeated terminals after a finish are skipped.
+        Unfinished tails count, same as MaxMC.
     unsafe: (T, A) optional collision/off-road flags. When given, an episode
         succeeds only if it reached the goal and never set unsafe (Learn-hard).
     Each vehicle gets its own success rate p_n. Always-succeed and
@@ -632,23 +863,25 @@ def compute_learnability(successes, dones=None, unsafe=None):
             raise ValueError("unsafe must have the same shape as successes")
 
     timesteps, agents = successes.shape
+    live, finish = episode_live_mask(dones)
     partial_hit = np.zeros(agents, dtype=np.float64)
     partial_unsafe = np.zeros(agents, dtype=np.float64)
     partial_steps = np.zeros(agents, dtype=np.float64)
     n_success = np.zeros(agents, dtype=np.float64)
     n_episodes = np.zeros(agents, dtype=np.float64)
     for t in range(timesteps):
-        partial_hit = np.maximum(partial_hit, (successes[t] > 0).astype(np.float64))
+        step_goal = (successes[t] > 0).astype(np.float64)
+        partial_hit = np.where(live[t], np.maximum(partial_hit, step_goal), partial_hit)
         if unsafe is not None:
-            partial_unsafe = np.maximum(partial_unsafe, (unsafe[t] > 0).astype(np.float64))
-        partial_steps += 1.0
-        done = dones[t] > 0
+            step_unsafe = (unsafe[t] > 0).astype(np.float64)
+            partial_unsafe = np.where(live[t], np.maximum(partial_unsafe, step_unsafe), partial_unsafe)
+        partial_steps = np.where(live[t], partial_steps + 1.0, partial_steps)
         ep_ok = partial_hit if unsafe is None else partial_hit * (1.0 - partial_unsafe)
-        n_success += np.where(done, ep_ok, 0.0)
-        n_episodes += done.astype(np.float64)
-        partial_hit = np.where(done, 0.0, partial_hit)
-        partial_unsafe = np.where(done, 0.0, partial_unsafe)
-        partial_steps = np.where(done, 0.0, partial_steps)
+        n_success = np.where(finish[t], n_success + ep_ok, n_success)
+        n_episodes = np.where(finish[t], n_episodes + 1.0, n_episodes)
+        partial_hit = np.where(finish[t], 0.0, partial_hit)
+        partial_unsafe = np.where(finish[t], 0.0, partial_unsafe)
+        partial_steps = np.where(finish[t], 0.0, partial_steps)
     open_tail = partial_steps > 0
     ep_ok = partial_hit if unsafe is None else partial_hit * (1.0 - partial_unsafe)
     n_success += np.where(open_tail, ep_ok, 0.0)

@@ -337,7 +337,7 @@ class PerScenarioEvaluator:
             raise ValueError("success must be 'score' or 'completion'")
         self.configs = configs
         self.logger = logger
-        self.sim_steps = 90
+        self.sim_steps = int(configs["env"].get("episode_length") or 110)
         self.self_play_stats = None
         self.human_replay_stats = None
         self.sp_env = None
@@ -358,7 +358,7 @@ class PerScenarioEvaluator:
         )
         num_maps = int(self._num_maps_override) if self._num_maps_override is not None else 10000
         eval_config["env"]["num_maps"] = num_maps
-        eval_config["env"]["episode_length"] = 130
+        eval_config["env"]["episode_length"] = int(self.sim_steps)
         eval_config["vec"] = dict(backend=backend, num_envs=1)
         eval_config["env"]["fix_lambdas"] = True
         eval_config["env"]["fix_rewards"] = True
@@ -721,7 +721,7 @@ class PerScenarioEvaluator:
 CATEGORY_COLORS = {
     "solved": "tab:green",
     "localized_failure": "tab:orange",
-    "globally_difficult": "tab:cyan",
+    "globally_suboptimal": "tab:cyan",
     "many_fail": "tab:red",
 }
 
@@ -788,7 +788,7 @@ def plot_results(result_dir, table=None, summary=None, logs=None):
     written = []
     fig, ax = plt.subplots(1, 3, figsize=(17, 4.8))
     _failure_panels(ax, table, summary)
-    fig.suptitle("structure: 1-car localized vs 2+ globally-difficult vs many-fail (return<0)", fontsize=10, y=1.02)
+    fig.suptitle("structure: 1-car localized vs 2+ globally-suboptimal vs many-fail (return<0)", fontsize=10, y=1.02)
     fig.tight_layout()
     path = os.path.join(result_dir, "failure_distribution.png")
     fig.savefig(path, dpi=130, bbox_inches="tight")
