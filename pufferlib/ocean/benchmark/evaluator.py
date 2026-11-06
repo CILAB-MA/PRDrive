@@ -17,8 +17,6 @@ import pufferlib
 from pufferlib.ocean.benchmark import metrics
 from pufferlib.ocean.benchmark import estimators
 from pufferlib.ocean.drive.level_sampler import (
-    fail_top1_share,
-    fail_worst_stat,
     merge_sampler_states,
     score_replay_weights,
 )
@@ -29,6 +27,8 @@ from pufferlib.ocean.benchmark.structure import (
     MIN_OUTCOME_EPISODES,
     STRUCTURE_CATEGORIES,
     classify_structure,
+    fail_top1_share,
+    fail_worst_stat,
 )
 
 
@@ -820,12 +820,6 @@ class WOSACEvaluator:
             plt.savefig(f"trajectory_comparison_agent_{agent_idx}.png")
 
 
-LENS_SPECS = {
-    "success": {"rate_key": "score", "invert": False},
-    "failure": {"rate_key": "collision_rate", "invert": True},
-    "return": {"rate_key": "episode_return", "invert": False},
-}
-
 def load_controllable_counts(map_dir, num_maps):
     path = os.path.join(str(map_dir), "controllable_counts.npy")
     if not os.path.isfile(path):
@@ -834,45 +828,29 @@ def load_controllable_counts(map_dir, num_maps):
     return np.asarray(counts[: min(int(num_maps), len(counts))], dtype=np.int32)
 
 
-def pack_maps_from(counts, start, budget, num_maps):
-    num_maps = int(num_maps)
-    if num_maps < 1:
-        raise ValueError("num_maps must be >= 1")
-    budget = max(int(budget), 1)
-    start = int(start) % num_maps
-    counts = None if counts is None else np.asarray(counts)
-    chosen = []
-    total = 0
-    idx = start
-    for _ in range(num_maps):
-        map_id = idx % num_maps
-        idx += 1
-        n = 1
-        if counts is not None and map_id < len(counts):
-            n = int(counts[map_id])
-        if n <= 0:
-            continue
-        chosen.append(map_id)
-        total += n
-        if total >= budget:
-            break
-    if not chosen:
-        chosen = [start]
-        total = 1
-        idx = start + 1
-    return np.asarray(chosen, dtype=np.int32), int(idx % num_maps), int(total)
-
-
-def structure_scalars(logs, prefix="analyze/structure"):
+def structure_scalars(logs, prefix="analyze/structure", plr_state=None):
     populated = [
         log
         for log in logs or []
         if log and float(log.get("n", 0) or 0) > 0 and "score" in log and "_plr_scores" not in log
     ]
+    packed = unpack_plr_state(plr_state) if plr_state is not None else None
+    fail_all = None if packed is None else packed.get("fail_ema")
+    n_all = None if packed is None else packed.get("outcome_n")
+    if fail_all is not None:
+        fail_all = np.asarray(fail_all)
+        n_all = None if n_all is None else np.asarray(n_all)
     map_categories = {}
     counts = {cat: 0 for cat in STRUCTURE_CATEGORIES}
     for log in populated:
-        cat = classify_structure(log)
+        fail_row = n_row = None
+        mid = log.get("map_id")
+        if fail_all is not None and n_all is not None and mid is not None:
+            idx = int(mid)
+            if 0 <= idx < fail_all.shape[0] and idx < n_all.shape[0]:
+                fail_row = fail_all[idx]
+                n_row = n_all[idx]
+        cat = classify_structure(log, fail_ema=fail_row, outcome_n=n_row)
         counts[cat] += 1
         if "map_id" in log:
             map_categories[int(log["map_id"])] = cat
@@ -915,26 +893,76 @@ def unpack_plr_state(plr_state):
     }
 
 
-def _lf_outcome_scalars(map_ids, categories, packed, prefix):
+def analyze_scenario_results(logs, plr_state=None, prefix="analyze", map_score="max_mc"):
+    """Structure split plus window means, keyed for wandb ``analyze/`` panels."""
+    populated = [
+        log
+        for log in logs or []
+        if log and float(log.get("n", 0) or 0) > 0 and "score" in log and "_plr_scores" not in log
+    ]
+    stats = {f"{prefix}/maps": float(len(populated))}
+    struct_stats, map_categories = structure_scalars(
+        populated, prefix=f"{prefix}/structure", plr_state=plr_state
+    )
+    stats.update(struct_stats)
+    for lens, key, invert in (
+        ("success", "score", False),
+        ("failure", "collision_rate", True),
+        ("return", "episode_return", False),
+    ):
+        rates, ns = [], []
+        for log in populated:
+            if key not in log:
+                continue
+            value = float(log[key])
+            rates.append((1.0 - value) if invert else value)
+            ns.append(float(log["n"]))
+        if ns:
+            nsum = float(sum(ns))
+            stats[f"{prefix}/{lens}/rate"] = float(sum(r * n for r, n in zip(rates, ns)) / nsum)
+    if plr_state is None or not map_categories:
+        return stats
+    packed = unpack_plr_state(plr_state)
+    scores = np.asarray(packed["scores"], dtype=np.float64).reshape(-1)
+    seen = np.asarray(packed["seen"], dtype=bool).reshape(-1)
+    ids = np.fromiter(map_categories.keys(), dtype=np.int64)
+    ids = ids[(ids >= 0) & (ids < scores.shape[0])]
+    if ids.size == 0:
+        return stats
+    struct = f"{prefix}/structure"
+    cats = np.array([map_categories[int(i)] for i in ids])
+    window_seen = seen[ids]
+    score_name = str(map_score or "max_mc").lower().replace("-", "_")
+    weights = score_replay_weights(
+        scores, seen, invert_scores=score_name in ("return", "episode_return")
+    )
+    denom_ids = ids[window_seen]
+    denom = float(weights[denom_ids].sum()) if denom_ids.size else 0.0
+    for cat in STRUCTURE_CATEGORIES:
+        mask = (cats == cat) & window_seen
+        stats[f"{struct}/plr_mean_{cat}"] = float(scores[ids[mask]].mean()) if mask.any() else 0.0
+        stats[f"{struct}/plr_weight_{cat}"] = (
+            float(weights[ids[mask]].sum() / denom) if denom > 0 and mask.any() else 0.0
+        )
     fail_ema = packed.get("fail_ema")
     coll_ema = packed.get("coll_ema")
     outcome_n = packed.get("outcome_n")
     if fail_ema is None or coll_ema is None or outcome_n is None:
-        return {}
+        return stats
     fail_ema = np.asarray(fail_ema, dtype=np.float64)
     coll_ema = np.asarray(coll_ema, dtype=np.float64)
     outcome_n = np.asarray(outcome_n, dtype=np.float64)
     hit_ema = packed.get("hit_ema")
     hit_ema = np.zeros_like(fail_ema) if hit_ema is None else np.asarray(hit_ema, dtype=np.float64)
     if fail_ema.ndim != 2 or fail_ema.shape != coll_ema.shape or fail_ema.shape != outcome_n.shape:
-        return {}
+        return stats
     if hit_ema.shape != fail_ema.shape:
         hit_ema = np.zeros_like(fail_ema)
     n_maps = fail_ema.shape[0]
     structural = oneoff = crash = dnf = multi = 0
     top1s = []
     worst_hits = []
-    for map_id, cat in zip(map_ids, categories):
+    for map_id, cat in zip(ids, cats):
         if cat != "localized_failure":
             continue
         idx = int(map_id)
@@ -968,73 +996,21 @@ def _lf_outcome_scalars(map_ids, categories, packed, prefix):
     n_out = float(len(top1s))
     n_mode = float(crash + dnf)
     n_hit = float(len(worst_hits))
-    stats = {
-        f"{prefix}/lf_outcomes_n": n_out,
-        f"{prefix}/lf_structural_share": float(structural / n_out) if n_out else 0.0,
-        f"{prefix}/lf_oneoff_share": float(oneoff / n_out) if n_out else 0.0,
-        f"{prefix}/lf_mean_top1": float(np.mean(top1s)) if top1s else 0.0,
-        f"{prefix}/lf_fail_is_collision": float(crash / n_mode) if n_mode else 0.0,
-        f"{prefix}/lf_fail_is_dnf": float(dnf / n_mode) if n_mode else 0.0,
-        f"{prefix}/lf_worst_hits": float(np.mean(worst_hits)) if worst_hits else 0.0,
-        f"{prefix}/lf_multi_hit_share": float(multi / n_hit) if n_hit else 0.0,
-    }
-    return stats
-
-
-def analyze_scalars(logs, plr_state=None, prefix="analyze", map_score="max_mc"):
-    """Structure split plus window means, keyed for wandb ``analyze/`` panels."""
-    populated = [
-        log
-        for log in logs or []
-        if log and float(log.get("n", 0) or 0) > 0 and "score" in log and "_plr_scores" not in log
-    ]
-    stats = {f"{prefix}/maps": float(len(populated))}
-    struct_stats, map_categories = structure_scalars(populated, prefix=f"{prefix}/structure")
-    stats.update(struct_stats)
-    for lens, spec in LENS_SPECS.items():
-        key = spec["rate_key"]
-        rates, ns = [], []
-        for log in populated:
-            if key not in log:
-                continue
-            value = float(log[key])
-            rates.append((1.0 - value) if spec["invert"] else value)
-            ns.append(float(log["n"]))
-        if ns:
-            nsum = float(sum(ns))
-            stats[f"{prefix}/{lens}/rate"] = float(sum(r * n for r, n in zip(rates, ns)) / nsum)
-    if plr_state is None or not map_categories:
-        return stats
-    packed = unpack_plr_state(plr_state)
-    scores = np.asarray(packed["scores"], dtype=np.float64).reshape(-1)
-    seen = np.asarray(packed["seen"], dtype=bool).reshape(-1)
-    ids = np.fromiter(map_categories.keys(), dtype=np.int64)
-    ids = ids[(ids >= 0) & (ids < scores.shape[0])]
-    if ids.size == 0:
-        return stats
-    struct = f"{prefix}/structure"
-    cats = np.array([map_categories[int(i)] for i in ids])
-    window_seen = seen[ids]
-    score_name = str(map_score or "max_mc").lower().replace("-", "_")
-    weights = score_replay_weights(
-        scores, seen, invert_scores=score_name in ("return", "episode_return")
-    )
-    denom_ids = ids[window_seen]
-    denom = float(weights[denom_ids].sum()) if denom_ids.size else 0.0
-    for cat in STRUCTURE_CATEGORIES:
-        mask = (cats == cat) & window_seen
-        stats[f"{struct}/plr_mean_{cat}"] = float(scores[ids[mask]].mean()) if mask.any() else 0.0
-        stats[f"{struct}/plr_weight_{cat}"] = (
-            float(weights[ids[mask]].sum() / denom) if denom > 0 and mask.any() else 0.0
-        )
-    stats.update(_lf_outcome_scalars(ids, cats, packed, struct))
+    stats[f"{struct}/lf_outcomes_n"] = n_out
+    stats[f"{struct}/lf_structural_share"] = float(structural / n_out) if n_out else 0.0
+    stats[f"{struct}/lf_oneoff_share"] = float(oneoff / n_out) if n_out else 0.0
+    stats[f"{struct}/lf_mean_top1"] = float(np.mean(top1s)) if top1s else 0.0
+    stats[f"{struct}/lf_fail_is_collision"] = float(crash / n_mode) if n_mode else 0.0
+    stats[f"{struct}/lf_fail_is_dnf"] = float(dnf / n_mode) if n_mode else 0.0
+    stats[f"{struct}/lf_worst_hits"] = float(np.mean(worst_hits)) if worst_hits else 0.0
+    stats[f"{struct}/lf_multi_hit_share"] = float(multi / n_hit) if n_hit else 0.0
     return stats
 
 
 def score_tail_map_ids(plr_state, k, map_dir, num_maps, tail=None, map_score="max_mc"):
     """Live hard-k training maps from the current sampler state.
 
-    Defaults to the hard end of the stored score: high MaxMC/PVL/learnability
+    Defaults to the hard end of the stored score: high MaxMC/learnability
     (/learnability_hard), low episode-return. Rank transform is not applied.
     Falls back to file-order maps if nothing has been seen yet.
     """
@@ -1069,43 +1045,6 @@ def score_tail_map_ids(plr_state, k, map_dir, num_maps, tail=None, map_score="ma
     return np.asarray(chosen or [0], dtype=np.int32)
 
 
-def tail_rank_scalars(map_ids, plr_state=None, prefix="analyze/lowk"):
-    """PLR rank stats for the maps that were actually rolled this eval."""
-    map_ids = np.asarray([] if map_ids is None else map_ids, dtype=np.int64)
-    stats = {f"{prefix}/k": float(map_ids.size)}
-    if plr_state is None or map_ids.size == 0:
-        return stats
-    packed = unpack_plr_state(plr_state)
-    scores = np.asarray(packed["scores"], dtype=np.float64).reshape(-1)
-    seen = np.asarray(packed["seen"], dtype=bool).reshape(-1)
-    stats[f"{prefix}/seen_n"] = float(seen.sum())
-    in_range = (map_ids >= 0) & (map_ids < scores.shape[0])
-    ids = map_ids[in_range]
-    if ids.size == 0:
-        return stats
-    selected = scores[ids]
-    stats[f"{prefix}/plr_mean"] = float(selected.mean())
-    stats[f"{prefix}/plr_min"] = float(selected.min())
-    stats[f"{prefix}/plr_max"] = float(selected.max())
-    return stats
-
-
-def agents_for_map_ids(map_dir, map_ids, num_maps):
-    map_ids = np.asarray(map_ids, dtype=np.int32)
-    if map_ids.size == 0:
-        return 1
-    counts = load_controllable_counts(map_dir, num_maps)
-    if counts is None:
-        return max(int(map_ids.size), 1)
-    total = 0
-    for map_id in map_ids:
-        if 0 <= int(map_id) < len(counts):
-            total += max(int(counts[int(map_id)]), 1)
-        else:
-            total += 1
-    return max(total, 1)
-
-
 def save_plr_state(path, plr_state, epoch=None, global_step=None):
     if plr_state is None:
         return None
@@ -1136,42 +1075,33 @@ def load_plr_state(path):
     return scores, seen, epoch, global_step
 
 
-def _sampler_state_dict(sampler):
-    return {
-        "scores": sampler.scores,
-        "seen": sampler.seen,
-        "fail_ema": sampler.fail_ema,
-        "coll_ema": sampler.coll_ema,
-        "hit_ema": sampler.hit_ema,
-        "outcome_n": sampler.outcome_n,
-    }
-
-
-def _as_plr_dict(merged):
-    if merged is None:
-        return None
-    if isinstance(merged, dict):
-        return merged
-    return {"scores": merged[0], "seen": merged[1]}
-
-
 def collect_train_plr_state(vecenv, worker_states=None):
     if worker_states:
         merged = merge_sampler_states(worker_states.values())
-        if merged is not None:
-            return _as_plr_dict(merged)
-    samplers = []
+        if merged is None:
+            return None
+        return merged if isinstance(merged, dict) else {"scores": merged[0], "seen": merged[1]}
+    states = []
     envs = getattr(vecenv, "envs", None)
     if envs:
-        samplers = [env.level_sampler for env in envs if getattr(env, "level_sampler", None) is not None]
+        candidates = [env for env in envs if getattr(env, "level_sampler", None) is not None]
     elif not hasattr(vecenv, "processes"):
         driver = getattr(vecenv, "driver_env", None)
-        sampler = getattr(driver, "level_sampler", None)
-        if sampler is not None:
-            samplers = [sampler]
-    if not samplers:
+        candidates = [driver] if getattr(driver, "level_sampler", None) is not None else []
+    else:
+        candidates = []
+    for env in candidates:
+        state = {"scores": env.level_sampler.scores, "seen": env.level_sampler.seen}
+        tracker = getattr(env, "fail_tracker", None)
+        if tracker is not None:
+            state.update(tracker.state_dict())
+        states.append(state)
+    if not states:
         return None
-    return _as_plr_dict(merge_sampler_states([_sampler_state_dict(s) for s in samplers]))
+    merged = merge_sampler_states(states)
+    if merged is None:
+        return None
+    return merged if isinstance(merged, dict) else {"scores": merged[0], "seen": merged[1]}
 
 
 class Evaluator:
@@ -1182,9 +1112,9 @@ class Evaluator:
     - render_eval: creates sp_env (if not already created)
 
     Self-play eval rolls the current hard-k training maps by the live PLR
-    score (high MaxMC/PVL/learnability; k matches human-replay's 200
-    validation maps) and labels them by failure structure. Human-replay
-    eval stays on ``eval.map_dir``.
+    score (high MaxMC/learnability; k matches human-replay's 200
+    validation maps) and labels them from the training fail EMA, not the
+    single eval roll. Human-replay eval stays on ``eval.map_dir``.
     """
 
     RENDER_FIRST = "first"
@@ -1242,7 +1172,15 @@ class Evaluator:
             queue = np.ascontiguousarray(self.map_id_queue, dtype=np.int32)
         else:
             queue = score_tail_map_ids(None, k, self.train_map_dir, self.train_num_maps)
-        n_agents = agents_for_map_ids(self.train_map_dir, queue, self.train_num_maps)
+        queue = np.asarray(queue, dtype=np.int32)
+        counts = load_controllable_counts(self.train_map_dir, self.train_num_maps)
+        n_agents = 0
+        for map_id in queue:
+            if counts is None or not (0 <= int(map_id) < len(counts)):
+                n_agents += 1
+            else:
+                n_agents += max(int(counts[int(map_id)]), 1)
+        n_agents = max(n_agents, 1)
         self.sp_eval_config["env"]["map_id_queue"] = queue
         self.sp_eval_config["env"]["num_agents"] = int(n_agents)
         self.train_sp_queue = queue
@@ -1534,12 +1472,37 @@ class Evaluator:
                 stats["eval/sp_mean_did_collide"] = float(np.mean(did_collide))
                 stats["eval/sp_score"] = float(np.mean([log["score"] for log in populated]))
                 stats["eval/sp_num_agents"] = float(np.mean([log["n"] for log in populated]))
-            stats.update(tail_rank_scalars(self.train_sp_queue, plr_state=plr_state))
+            map_score = self.configs.get("env", {}).get("map_score", "max_mc")
+            if plr_state is not None:
+                packed = unpack_plr_state(plr_state)
+                scores = np.asarray(packed["scores"], dtype=np.float64).reshape(-1)
+                seen = np.asarray(packed["seen"], dtype=bool).reshape(-1)
+                k = int(self.configs.get("eval", {}).get("score_tail_k", 200))
+                for tail, prefix in (("low", "analyze/lowk"), ("high", "analyze/highk")):
+                    ids = np.asarray(
+                        score_tail_map_ids(
+                            plr_state,
+                            k,
+                            self.train_map_dir,
+                            self.train_num_maps,
+                            tail=tail,
+                            map_score=map_score,
+                        ),
+                        dtype=np.int64,
+                    )
+                    stats[f"{prefix}/k"] = float(ids.size)
+                    stats[f"{prefix}/seen_n"] = float(seen.sum())
+                    ids = ids[(ids >= 0) & (ids < scores.shape[0])]
+                    if ids.size:
+                        selected = scores[ids]
+                        stats[f"{prefix}/plr_mean"] = float(selected.mean())
+                        stats[f"{prefix}/plr_min"] = float(selected.min())
+                        stats[f"{prefix}/plr_max"] = float(selected.max())
             stats.update(
-                analyze_scalars(
+                analyze_scenario_results(
                     self.self_play_stats,
                     plr_state=plr_state,
-                    map_score=self.configs.get("env", {}).get("map_score", "max_mc"),
+                    map_score=map_score,
                 )
             )
 

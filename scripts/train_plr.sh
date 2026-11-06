@@ -2,7 +2,7 @@
 # Train puffer_drive with Prioritized Level Replay.
 #
 # Overrides map_sampling_strategy to prioritized. Map scores default to MaxMC
-# (MAP_SCORE=max_mc; also return, pvl, learnability, learnability_hard).
+# (MAP_SCORE=max_mc; also return, learnability, learnability_hard).
 # CL4AD 10K rank β / staleness ρ are set from MAP_SCORE unless PLR_TEMPERATURE
 # or PLR_STALENESS is exported. The queue length comes from
 # controllable_counts.npy next to the training bins.
@@ -11,7 +11,6 @@
 #   ./scripts/train_plr.sh 0 maxmc_10k
 #   MAP_SCORE=learnability ./scripts/train_plr.sh 1 learn_10k
 #   MAP_SCORE=learnability_hard ./scripts/train_plr.sh 1 learn_hard_10k
-#   MAP_SCORE=pvl ./scripts/train_plr.sh 0 pvl_10k
 #
 # wandb group follows MAP_SCORE: max_mc → maxmc, learnability → learn,
 # learnability_hard → learn_hard.
@@ -66,11 +65,6 @@ case "${MAP_SCORE}" in
     SCORE_GROUP="learn_hard"
     PLR_TEMPERATURE="${PLR_TEMPERATURE:-2}"
     PLR_STALENESS="${PLR_STALENESS:-0.1}"
-    ;;
-  pvl)
-    SCORE_GROUP="pvl"
-    PLR_TEMPERATURE="${PLR_TEMPERATURE:-4}"
-    PLR_STALENESS="${PLR_STALENESS:-0.3}"
     ;;
   return)
     SCORE_GROUP="return"

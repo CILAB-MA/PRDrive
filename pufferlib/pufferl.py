@@ -267,7 +267,7 @@ class PuffeRL:
 
     def _publish_plr_values(self, value):
         driver = getattr(self.vecenv, "driver_env", None)
-        if driver is None or getattr(driver, "map_score", None) not in ("max_mc", "pvl"):
+        if driver is None or getattr(driver, "map_score", None) != "max_mc":
             return
         if getattr(driver, "level_sampler", None) is None:
             return

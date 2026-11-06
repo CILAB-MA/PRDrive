@@ -5,9 +5,6 @@ import copy
 import json
 import os
 import re
-import shutil
-import subprocess
-import time
 from collections import defaultdict
 
 import numpy as np
@@ -48,21 +45,7 @@ METRIC_KEYS = (
 CATEGORIES = STRUCTURE_CATEGORIES
 RATE_KEYS = tuple(k for k in METRIC_KEYS if k != "n")
 DEFAULT_TRAIN_MAP_DIR = "/data/prdrive/binaries/training_80000"
-
-
-def _to_python(value):
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    return value
-
-
-LENS_METRICS = {
-    "success": "score",
-    "collision": "safety_rate",
-    "return": "episode_return",
-}
+DEFAULT_VAL_MAP_DIR = "/data/prdrive/binaries/validation"
 
 
 def _controllable_counts(map_dir, num_maps):
@@ -71,34 +54,6 @@ def _controllable_counts(map_dir, num_maps):
         return None
     counts = np.asarray(np.load(path))
     return np.asarray(counts[: min(int(num_maps), len(counts))], dtype=np.int32)
-
-
-def agent_budget_for_maps(map_dir, num_maps, control_mode):
-    """Agent count is determined by the maps + control mode, not num_eval_agents.
-
-    self-play / control_agents: sum of controllable cars on map_000..map_{N-1}.
-    human-replay / control_sdc_only: one SDC per map.
-    """
-    num_maps = int(num_maps)
-    if control_mode == "control_sdc_only":
-        return num_maps
-    counts = _controllable_counts(map_dir, num_maps)
-    if counts is not None and int(counts.sum()) > 0:
-        return int(counts.sum())
-    return num_maps
-
-
-def _agents_for_ids(map_dir, map_ids, control_mode):
-    map_ids = np.asarray(map_ids, dtype=np.int32)
-    if map_ids.size == 0:
-        return 1
-    if control_mode == "control_sdc_only":
-        return int(map_ids.size)
-    counts = _controllable_counts(map_dir, int(map_ids.max()) + 1)
-    if counts is None:
-        return int(map_ids.size)
-    total = int(sum(int(counts[i]) for i in map_ids if i < len(counts)))
-    return max(total, 1)
 
 
 def iter_map_batches(map_dir, num_maps, control_mode, max_agents=2048):
@@ -126,58 +81,6 @@ def iter_map_batches(map_dir, num_maps, control_mode, max_agents=2048):
 
 def _safe_name(value):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip()).strip("_") or "unknown"
-
-
-def _find_mp4(directory, scenario_id):
-    exact = os.path.join(directory, f"{scenario_id}.mp4")
-    if os.path.isfile(exact):
-        return exact
-    matches = [os.path.join(directory, name) for name in os.listdir(directory) if name.endswith(".mp4")]
-    if len(matches) == 1:
-        return matches[0]
-    return None
-
-
-def _start_headless_display():
-    """Drive/GLFW still need an X server. Host DISPLAY=:0 is often unusable, so start Xvfb."""
-    xvfb = shutil.which("Xvfb")
-    if xvfb is None:
-        raise RuntimeError("Xvfb not found; install xvfb or pass --no-gif-failures")
-    prev = os.environ.get("DISPLAY")
-    display_num = 100 + (os.getpid() % 900)
-    display = f":{display_num}"
-    proc = subprocess.Popen(
-        [xvfb, display, "-screen", "0", "1920x1080x24", "+extension", "GLX", "-ac", "-noreset"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    lock = f"/tmp/.X{display_num}-lock"
-    for _ in range(40):
-        if os.path.exists(lock) or proc.poll() is not None:
-            break
-        time.sleep(0.1)
-    time.sleep(0.2)
-    if proc.poll() is not None:
-        raise RuntimeError(f"Xvfb failed to start on {display}")
-    os.environ["DISPLAY"] = display
-    print(f"  headless display {display} (was {prev!r})")
-    return {"proc": proc, "prev_display": prev}
-
-
-def _stop_headless_display(state):
-    if not state:
-        return
-    proc = state["proc"]
-    if proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-    if state["prev_display"] is None:
-        os.environ.pop("DISPLAY", None)
-    else:
-        os.environ["DISPLAY"] = state["prev_display"]
 
 
 INVALID_XY = -5000.0
@@ -382,7 +285,17 @@ class PerScenarioEvaluator:
         config = copy.deepcopy(self.hr_eval_config if mode == "human_replay" else self.sp_eval_config)
         control_mode = config["env"]["control_mode"]
         config["env"]["map_id_queue"] = map_ids
-        config["env"]["num_agents"] = _agents_for_ids(self.map_dir, map_ids, control_mode)
+        if map_ids.size == 0:
+            n_agents = 1
+        elif control_mode == "control_sdc_only":
+            n_agents = int(map_ids.size)
+        else:
+            counts = _controllable_counts(self.map_dir, int(map_ids.max()) + 1)
+            if counts is None:
+                n_agents = int(map_ids.size)
+            else:
+                n_agents = max(int(sum(int(counts[i]) for i in map_ids if i < len(counts))), 1)
+        config["env"]["num_agents"] = n_agents
         if render:
             config["env"]["render_mode"] = 1
         return config
@@ -457,7 +370,10 @@ class PerScenarioEvaluator:
             log["env_idx"] = i
             log["mode"] = mode
             for key, value in list(log.items()):
-                log[key] = _to_python(value)
+                if isinstance(value, np.generic):
+                    log[key] = value.item()
+                elif isinstance(value, np.ndarray):
+                    log[key] = value.tolist()
         return logs
 
     def failure_logs(self):
@@ -800,9 +716,19 @@ def plot_results(result_dir, table=None, summary=None, logs=None):
         fig, axes = plt.subplots(len(modes), 3, figsize=(17, 4.4 * len(modes)))
         for i, mode in enumerate(modes):
             part = table[table["mode"] == mode]
-            part_summary = _summary_from_table(part)
+            total_fail = float(part["failures"].sum()) if "failures" in part.columns else 0.0
+            rows = []
+            for cat in CATEGORIES:
+                chunk = part[part["category"] == cat]
+                failed = float(chunk["failures"].sum()) if (not chunk.empty and "failures" in chunk.columns) else 0.0
+                rows.append(
+                    {
+                        "category": cat,
+                        "share_of_all_failures": (failed / total_fail) if total_fail > 0 else 0.0,
+                    }
+                )
             row = axes[i]
-            _failure_panels(row, part, part_summary, title_prefix=f"{mode}: ")
+            _failure_panels(row, part, pd.DataFrame(rows), title_prefix=f"{mode}: ")
         fig.tight_layout()
         path = os.path.join(result_dir, "failure_distribution_by_mode.png")
         fig.savefig(path, dpi=130, bbox_inches="tight")
@@ -829,20 +755,3 @@ def plot_results(result_dir, table=None, summary=None, logs=None):
                 written.append(path)
 
     return written
-
-
-def _summary_from_table(table):
-    if table.empty:
-        return pd.DataFrame(columns=["category", "share_of_all_failures"])
-    total_fail = float(table["failures"].sum()) if "failures" in table.columns else 0.0
-    rows = []
-    for cat in CATEGORIES:
-        part = table[table["category"] == cat]
-        failed = float(part["failures"].sum()) if (not part.empty and "failures" in part.columns) else 0.0
-        rows.append(
-            {
-                "category": cat,
-                "share_of_all_failures": (failed / total_fail) if total_fail > 0 else 0.0,
-            }
-        )
-    return pd.DataFrame(rows)

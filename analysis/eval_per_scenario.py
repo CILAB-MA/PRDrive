@@ -9,7 +9,13 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
-from per_scenario import DEFAULT_TRAIN_MAP_DIR, MAX_LOCALIZED_CARS, PerScenarioEvaluator, plot_results
+from per_scenario import (
+    DEFAULT_TRAIN_MAP_DIR,
+    DEFAULT_VAL_MAP_DIR,
+    MAX_LOCALIZED_CARS,
+    PerScenarioEvaluator,
+    plot_results,
+)
 from pufferlib import pufferl
 
 ENV_NAME = "puffer_drive"
@@ -21,7 +27,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Per-scenario metrics (Evaluator-style)")
     parser.add_argument("--exp-name", type=str, default=None)
     parser.add_argument("--checkpoint", type=str, default=None, help="Run a single .pt instead of all seeds")
-    parser.add_argument("--map-dir", type=str, default=DEFAULT_TRAIN_MAP_DIR)
+    parser.add_argument(
+        "--map-dir",
+        type=str,
+        default=None,
+        help="Map binaries. Default: validation for --mode human_replay, else training.",
+    )
     parser.add_argument("--num-maps", type=int, default=10000,)
     parser.add_argument("--max-agents", type=int, default=2048,)
     parser.add_argument("--mode", type=str, default="both", choices=["self_play", "human_replay", "both"])
@@ -145,6 +156,8 @@ def _write_plots(evaluator, result_dir):
 
 def main():
     args = parse_args()
+    if args.map_dir is None:
+        args.map_dir = DEFAULT_VAL_MAP_DIR if args.mode == "human_replay" else DEFAULT_TRAIN_MAP_DIR
     if args.report_only:
         from three_lens import run as run_three_lens
 
