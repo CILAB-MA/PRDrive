@@ -175,10 +175,11 @@ class LevelSampler:
                 alpha = 0.1
                 k = max(1, int(np.ceil(alpha * stored.size)))
                 ordered = np.sort(stored)
+                # Hard tail: MaxMC high=hard → upper; return low=hard → lower.
                 if self.invert_scores:
-                    reduced = float(ordered[-k:].mean())
-                else:
                     reduced = float(ordered[:k].mean())
+                else:
+                    reduced = float(ordered[-k:].mean())
 
             self.update(map_id, reduced)
             return float(self.scores[map_id])

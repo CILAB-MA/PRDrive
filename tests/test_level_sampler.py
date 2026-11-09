@@ -161,6 +161,30 @@ def test_max_mc_uses_best_return_minus_value():
     stored = low.score(0, "max_mc", rewards=rewards, values=values, dones=dones)
     assert stored == -1.0
 
+    # 11 cars → CVaR α=0.1 uses k=2, so it is not the same as top.
+    n = 11
+    rewards = np.zeros((2, n))
+    values = np.ones((2, n))
+    dones = np.ones((2, n))
+    dones[0] = 0
+    rewards[:, 0] = 1.0
+    values[:, 0] = 0.0
+    hard = LevelSampler(
+        num_maps=1, strategy="sequential", score_aggregate="cvar", alpha=1.0, gae_gamma=1.0
+    )
+    stored = hard.score(0, "max_mc", rewards=rewards, values=values, dones=dones)
+    assert stored == 0.5
+    easy = LevelSampler(
+        num_maps=1,
+        strategy="sequential",
+        score_aggregate="cvar",
+        invert_scores=True,
+        alpha=1.0,
+        gae_gamma=1.0,
+    )
+    stored = easy.score(0, "max_mc", rewards=rewards, values=values, dones=dones)
+    assert stored == -1.0
+
 
 def test_max_mc_keeps_per_vehicle_max_return_across_visits():
     ls = LevelSampler(
