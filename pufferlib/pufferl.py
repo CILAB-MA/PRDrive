@@ -267,7 +267,7 @@ class PuffeRL:
 
     def _publish_plr_values(self, value):
         driver = getattr(self.vecenv, "driver_env", None)
-        if driver is None or getattr(driver, "map_score", None) not in ("max_mc", "pvl"):
+        if driver is None or getattr(driver, "map_score", None) != "max_mc":
             return
         if getattr(driver, "level_sampler", None) is None:
             return
@@ -277,10 +277,17 @@ class PuffeRL:
         if not isinstance(info, dict) or "_plr_scores" not in info:
             return False
         pid = int(info.get("_plr_worker", 0))
-        self._plr_worker_states[pid] = (
-            np.asarray(info["_plr_scores"], dtype=np.float64),
-            np.asarray(info["_plr_seen"], dtype=bool),
-        )
+        state = {
+            "scores": np.asarray(info["_plr_scores"], dtype=np.float64),
+            "seen": np.asarray(info["_plr_seen"], dtype=bool),
+        }
+        if "_plr_fail_ema" in info and "_plr_coll_ema" in info and "_plr_outcome_n" in info:
+            state["fail_ema"] = np.asarray(info["_plr_fail_ema"], dtype=np.float64)
+            state["coll_ema"] = np.asarray(info["_plr_coll_ema"], dtype=np.float64)
+            state["outcome_n"] = np.asarray(info["_plr_outcome_n"], dtype=np.float64)
+            if "_plr_hit_ema" in info:
+                state["hit_ema"] = np.asarray(info["_plr_hit_ema"], dtype=np.float64)
+        self._plr_worker_states[pid] = state
         return True
 
     def evaluate(self):

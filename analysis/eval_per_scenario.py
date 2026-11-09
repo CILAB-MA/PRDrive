@@ -4,12 +4,19 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
-from per_scenario import DEFAULT_TRAIN_MAP_DIR, MAX_LOCALIZED_CARS, PerScenarioEvaluator, plot_results
+from per_scenario import (
+    DEFAULT_TRAIN_MAP_DIR,
+    DEFAULT_VAL_MAP_DIR,
+    MAX_LOCALIZED_CARS,
+    PerScenarioEvaluator,
+    plot_results,
+)
 from pufferlib import pufferl
 
 ENV_NAME = "puffer_drive"
@@ -21,7 +28,17 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Per-scenario metrics (Evaluator-style)")
     parser.add_argument("--exp-name", type=str, default=None)
     parser.add_argument("--checkpoint", type=str, default=None, help="Run a single .pt instead of all seeds")
-    parser.add_argument("--map-dir", type=str, default=DEFAULT_TRAIN_MAP_DIR)
+    parser.add_argument(
+        "--all-checkpoints",
+        action="store_true",
+        help="Evaluate every model_*.pt in the experiment run dirs, not just the final seed copies.",
+    )
+    parser.add_argument(
+        "--map-dir",
+        type=str,
+        default=None,
+        help="Map binaries. Default: validation for --mode human_replay, else training.",
+    )
     parser.add_argument("--num-maps", type=int, default=10000,)
     parser.add_argument("--max-agents", type=int, default=2048,)
     parser.add_argument("--mode", type=str, default="both", choices=["self_play", "human_replay", "both"])
@@ -32,7 +49,7 @@ def parse_args():
         "--max-localized-cars",
         type=int,
         default=MAX_LOCALIZED_CARS,
-        help="Complete car-fails at or below this count are localized_failure; above is globally_difficult. return<0 is many_fail first.",
+        help="Complete car-fails at or below this count are localized_failure; above is globally_suboptimal. return<0 is many_fail first.",
     )
     parser.add_argument("--plot", action="store_true", help="Write PNG figures next to the CSVs")
     parser.add_argument(
@@ -71,14 +88,7 @@ def _load_config():
         sys.argv = argv
 
 
-def find_checkpoints(exp_name, checkpoint=None):
-    if checkpoint:
-        if not os.path.isfile(checkpoint):
-            raise SystemExit(f"checkpoint not found: {checkpoint}")
-        return [os.path.abspath(checkpoint)]
-    if not exp_name:
-        raise SystemExit("pass --exp-name or --checkpoint")
-
+def _exp_dir(exp_name):
     candidates = [
         os.path.join(EXP_ROOT, exp_name),
         os.path.join("experiments", exp_name),
@@ -87,6 +97,43 @@ def find_checkpoints(exp_name, checkpoint=None):
     exp_dir = next((path for path in candidates if os.path.isdir(path)), None)
     if exp_dir is None:
         raise SystemExit(f"no experiment dir for {exp_name!r}; tried {candidates}")
+    return exp_dir
+
+
+def _ckpt_epoch(path):
+    match = re.search(r"_(\d+)\.pt$", os.path.basename(path))
+    return int(match.group(1)) if match else -1
+
+
+def _ckpt_run_id(path):
+    parent = os.path.basename(os.path.dirname(os.path.abspath(path)))
+    return parent
+
+
+def find_checkpoints(exp_name, checkpoint=None, all_checkpoints=False):
+    if checkpoint:
+        if not os.path.isfile(checkpoint):
+            raise SystemExit(f"checkpoint not found: {checkpoint}")
+        return [os.path.abspath(checkpoint)]
+    if not exp_name:
+        raise SystemExit("pass --exp-name or --checkpoint")
+
+    exp_dir = _exp_dir(exp_name)
+    if all_checkpoints:
+        ckpts = []
+        for run_dir in sorted(glob.glob(os.path.join(exp_dir, "*"))):
+            if not os.path.isdir(run_dir):
+                continue
+            models = [
+                os.path.abspath(p)
+                for p in glob.glob(os.path.join(run_dir, "model_*.pt"))
+                if os.path.isfile(p)
+            ]
+            models.sort(key=lambda p: (_ckpt_epoch(p), os.path.basename(p)))
+            ckpts.extend(models)
+        if not ckpts:
+            raise SystemExit(f"no model_*.pt checkpoints in {exp_dir}")
+        return ckpts
 
     finals = sorted(path for path in glob.glob(os.path.join(exp_dir, "*.pt")) if os.path.isfile(path))
     if finals:
@@ -98,13 +145,17 @@ def find_checkpoints(exp_name, checkpoint=None):
             continue
         models = glob.glob(os.path.join(run_dir, "model_*.pt"))
         if models:
-            ckpts.append(max(models, key=lambda path: (os.path.getmtime(path), path)))
+            ckpts.append(max(models, key=lambda path: (_ckpt_epoch(path), os.path.getmtime(path), path)))
     if not ckpts:
         raise SystemExit(f"no .pt checkpoints in {exp_dir}")
     return ckpts
 
 
 def _ckpt_stem(path):
+    epoch = _ckpt_epoch(path)
+    run_id = _ckpt_run_id(path)
+    if epoch >= 0 and run_id:
+        return f"{run_id}_{epoch:06d}"
     return os.path.splitext(os.path.basename(path))[0]
 
 
@@ -117,6 +168,8 @@ def _tag_logs(logs, checkpoint, exp_name):
             continue
         log["checkpoint"] = stem
         log["checkpoint_path"] = checkpoint
+        log["run_id"] = _ckpt_run_id(checkpoint)
+        log["epoch"] = _ckpt_epoch(checkpoint)
         if exp_name:
             log["exp_name"] = exp_name
 
@@ -145,6 +198,8 @@ def _write_plots(evaluator, result_dir):
 
 def main():
     args = parse_args()
+    if args.map_dir is None:
+        args.map_dir = DEFAULT_VAL_MAP_DIR if args.mode == "human_replay" else DEFAULT_TRAIN_MAP_DIR
     if args.report_only:
         from three_lens import run as run_three_lens
 
@@ -159,8 +214,8 @@ def main():
             print(f"  {path}")
         return
 
-    checkpoints = find_checkpoints(args.exp_name, args.checkpoint)
-    if args.exp_name and args.checkpoint is None and len(checkpoints) != 3:
+    checkpoints = find_checkpoints(args.exp_name, args.checkpoint, all_checkpoints=args.all_checkpoints)
+    if args.exp_name and args.checkpoint is None and not args.all_checkpoints and len(checkpoints) != 3:
         print(f"warning: expected 3 seed checkpoints, found {len(checkpoints)}")
 
     result_dir = args.result_dir or os.path.join(

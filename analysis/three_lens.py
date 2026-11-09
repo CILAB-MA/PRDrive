@@ -112,10 +112,10 @@ def write_plots(table, summaries, out_dir):
     colors = {
         "solved": "tab:green",
         "localized_failure": "tab:orange",
-        "globally_difficult": "tab:cyan",
+        "globally_suboptimal": "tab:cyan",
         "many_fail": "tab:red",
     }
-    labels = ["solved", "localized (1 car)", "global (2+ cars)", "many-fail (ret<0)"]
+    labels = ["solved", "localized (1 car)", "globally suboptimal (2+ cars)", "many-fail (ret<0)"]
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.4), sharey=True)
     titles = {
         "success": "Success (failed cars)",
@@ -169,7 +169,7 @@ def write_report(table, summaries, skipped, out_dir):
 
     skip_txt = ", ".join(f"{s} ({n} rows)" for s, n in skipped) or "none"
     loc = table[table["category"] == "localized_failure"]
-    mild = table[table["category"] == "globally_difficult"]
+    mild = table[table["category"] == "globally_suboptimal"]
     hard = table[table["category"] == "many_fail"]
     loc_crashless = int(((loc["collision_rate"] == 0) & (loc["n"] > 0)).sum()) if not loc.empty else 0
 
@@ -182,7 +182,7 @@ def write_report(table, summaries, skipped, out_dir):
     lines.append("- `solved`: no complete car-fail")
     lines.append("- `many_fail`: at least one fail and map mean return < 0 (more veh+off-road hits than cars)")
     lines.append("- `localized_failure`: exactly one complete car-fail, return ≥ 0 (the rest cover the mean)")
-    lines.append("- `globally_difficult`: two or more complete car-fails, return ≥ 0 (failure is spread)")
+    lines.append("- `globally_suboptimal`: two or more complete car-fails, return ≥ 0 (failure is spread)")
     lines.append("")
     lines.append("Harm is still reported three ways on **the same** structure labels.")
     lines.append("")
@@ -200,7 +200,7 @@ def write_report(table, summaries, skipped, out_dir):
     lines.append("2. Label each seed row with `classify_structure`, then pool by `(mode, map_id)`.")
     lines.append("3. Pooled label is the **majority** of per-seed labels (tie → more severe).")
     lines.append("   return < 0 on a seed is many_fail. 1 fail on every seed stays localized.")
-    lines.append("   2+ fails on a seed is globally_difficult. 1 fail on 1 of 3 seeds stays solved.")
+    lines.append("   2+ fails on a seed is globally_suboptimal. 1 fail on 1 of 3 seeds stays solved.")
     lines.append("   n-sum across seeds is not used for the label.")
     lines.append("4. Rates are car-weighted. Harm uses mean n per seed.")
     lines.append("")
@@ -226,12 +226,12 @@ def write_report(table, summaries, skipped, out_dir):
         lines.append("- Localized: none")
     if not mild.empty:
         lines.append(
-            f"- Globally difficult (2+ cars): {len(mild)} scenes, mean score {float((mild.score*mild.n).sum()/mild.n.sum()):.3f}, "
+            f"- Globally suboptimal (2+ cars): {len(mild)} scenes, mean score {float((mild.score*mild.n).sum()/mild.n.sum()):.3f}, "
             f"mean return {float((mild.episode_return*mild.n).sum()/mild.n.sum()):.3f}, "
             f"mean failed cars {float(mild.failed_cars.mean()):.2f}"
         )
     else:
-        lines.append("- Globally difficult (2+ cars): none")
+        lines.append("- Globally suboptimal (2+ cars): none")
     if not hard.empty:
         lines.append(
             f"- Many-fail (return < 0): {len(hard)} scenes, mean score {float((hard.score*hard.n).sum()/hard.n.sum()):.3f}, "
@@ -253,7 +253,7 @@ def write_report(table, summaries, skipped, out_dir):
             f"collision {(part.collision_rate*part.n).sum()/cars:.4f}, "
             f"return {(part.episode_return*part.n).sum()/cars:.4f}; "
             f"localized {int(counts.get('localized_failure', 0))}, "
-            f"globally_difficult {int(counts.get('globally_difficult', 0))}, "
+            f"globally_suboptimal {int(counts.get('globally_suboptimal', 0))}, "
             f"many_fail {int(counts.get('many_fail', 0))}"
         )
     lines.append("")
@@ -274,7 +274,7 @@ def write_report(table, summaries, skipped, out_dir):
         "pooled_col": pooled_col,
         "pooled_ret": pooled_ret,
         "n_localized": int(len(loc)),
-        "n_globally_difficult": int(len(mild)),
+        "n_globally_suboptimal": int(len(mild)),
         "n_many_fail": int(len(hard)),
     }
 

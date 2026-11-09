@@ -9,7 +9,8 @@ import pufferlib
 import math
 from enum import IntEnum
 from pufferlib.ocean.drive import binding
-from pufferlib.ocean.drive.level_sampler import LevelSampler
+from pufferlib.ocean.drive.level_sampler import LevelSampler, plr_hypers_for_score
+from pufferlib.ocean.benchmark.structure import FailTracker
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -87,8 +88,12 @@ class Drive(pufferlib.PufferEnv):
         obs_partner_noise_speed=0.0,
         obs_partner_noise_pos=0.0,
         async_resets=True,
+        # PLR args
         map_sampling_strategy="uniform",  # "uniform", "prioritized", or "sequential"
-        map_score="return",  # "return", "max_mc", "pvl", or "learnability"
+        map_score="return",  # "return", "max_mc", "learnability", or "learnability_hard"
+        plr_temperature=None,  # rank β; None uses the CL4AD preset for map_score
+        plr_staleness_coef=None,  # staleness ρ; None uses the CL4AD preset for map_score
+        score_aggregate="mean",  # MaxMC per-vehicle collapse: mean, top, or cvar
         eval_map_log_path=None,  # eval only: save per-map logs (see _dump_map_logs)
         map_id_queue=None,  # optional explicit map ids for eval; C still stops at the agent budget
     ):
@@ -107,18 +112,29 @@ class Drive(pufferlib.PufferEnv):
         # instead (see binding.c: my_shared's map_id_queue).
         self.map_sampling_strategy = map_sampling_strategy
         self.map_score = map_score
-        if map_score not in ("return", "max_mc", "pvl", "learnability"):
+        if map_score not in ("return", "max_mc", "learnability", "learnability_hard"):
             raise ValueError(
-                f"map_score must be 'return', 'max_mc', 'pvl', or 'learnability'. Got: {map_score!r}"
+                "map_score must be 'return', 'max_mc', 'learnability', or "
+                f"'learnability_hard'. Got: {map_score!r}"
             )
+        self.plr_temperature, self.plr_staleness_coef = plr_hypers_for_score(
+            map_score, temperature=plr_temperature, staleness_coef=plr_staleness_coef
+        )
         if map_sampling_strategy == "uniform":
             self.level_sampler = None
+            self.fail_tracker = None
         elif map_sampling_strategy in ("prioritized", "sequential"):
             self.level_sampler = LevelSampler(
                 num_maps=num_maps,
                 seed=seed,
                 strategy=map_sampling_strategy,
+                temperature=self.plr_temperature,
+                staleness_coef=self.plr_staleness_coef,
+                max_controlled_agents=max_controlled_agents,
+                invert_scores=map_score in ("return", "episode_return"),
+                score_aggregate=score_aggregate,
             )
+            self.fail_tracker = FailTracker(num_maps, max_controlled_agents)
         else:
             raise ValueError(
                 f"map_sampling_strategy must be 'uniform', 'prioritized', or 'sequential'. Got: {map_sampling_strategy!r}"
@@ -130,15 +146,17 @@ class Drive(pufferlib.PufferEnv):
         self._plr_values = None
         self._plr_dones = None
         self._plr_successes = None
+        self._plr_unsafe = None
         if self.level_sampler is not None:
-            if self.map_score in ("max_mc", "pvl"):
+            if self.map_score == "max_mc":
                 self._plr_value_buf = buf.get("values") if isinstance(buf, dict) and "values" in buf else None
                 self._plr_rewards = []
                 self._plr_values = []
                 self._plr_dones = []
-            elif self.map_score == "learnability":
+            elif self.map_score in ("learnability", "learnability_hard"):
                 self._plr_successes = []
                 self._plr_dones = []
+                self._plr_unsafe = []
         self.reward_vehicle_collision = reward_vehicle_collision
         self.reward_offroad_collision = reward_offroad_collision
         self.reward_goal = reward_goal
@@ -285,7 +303,7 @@ class Drive(pufferlib.PufferEnv):
         # Iterate through all maps to count total agents that can be initialized for each map
         self._map_load_idx = 0
         self.map_load_log = []
-        map_id_queue, _ = self._build_map_id_queue(num_agents)
+        map_id_queue = self._build_map_id_queue(num_agents)
         agent_offsets, map_ids, num_envs = binding.shared(
             seed=seed,
             map_dir=map_dir,
@@ -384,24 +402,15 @@ class Drive(pufferlib.PufferEnv):
         if self.level_sampler is None:
             return None
         path = os.path.join(map_dir, "controllable_counts.npy")
-        if not os.path.exists(path):
-            raise FileNotFoundError(
-                f"{path} not found. Place controllable_counts.npy next to the map bins before sampling."
-            )
         counts = np.load(path)
-        if counts.shape[0] < num_maps:
-            raise ValueError(
-                f"{path} has {counts.shape[0]} entries, but num_maps is {num_maps}."
-            )
         return np.asarray(counts[:num_maps], dtype=np.int32)
 
     def _build_map_id_queue(self, batch_size):
         if self._explicit_map_id_queue is not None:
-            return self._explicit_map_id_queue, {}
+            return self._explicit_map_id_queue
         if self.level_sampler is None:
-            return None, {}
-        map_id_queue, metrics = self.level_sampler.sample_until(self.controllable_counts, batch_size)
-        return map_id_queue, metrics
+            return None
+        return self.level_sampler.sample_queue(self.controllable_counts, batch_size)
 
     def _report_map_scores_to_sampler(self):
         if self.level_sampler is None:
@@ -414,6 +423,7 @@ class Drive(pufferlib.PufferEnv):
         if learn_ready:
             successes = np.stack(self._plr_successes)
             dones = np.stack(self._plr_dones)
+            unsafe = None if self._plr_unsafe is None else np.stack(self._plr_unsafe)
         elif rollout_ready:
             rewards = np.stack(self._plr_rewards)
             values = np.stack(self._plr_values)
@@ -429,12 +439,25 @@ class Drive(pufferlib.PufferEnv):
                 # Writes LevelSampler.scores[map_id] and returns that buffer value.
                 if learn_ready:
                     score = self.level_sampler.score(
-                        map_id, self.map_score, successes=successes[:, sl], dones=dones[:, sl]
+                        map_id,
+                        self.map_score,
+                        successes=successes[:, sl],
+                        dones=dones[:, sl],
+                        unsafe=None if unsafe is None else unsafe[:, sl],
                     )
+                    if self.fail_tracker is not None:
+                        self.fail_tracker.update(
+                            map_id,
+                            successes=successes[:, sl],
+                            dones=dones[:, sl],
+                            unsafe=None if unsafe is None else unsafe[:, sl],
+                        )
                 else:
                     score = self.level_sampler.score(
                         map_id, self.map_score, rewards=rewards[:, sl], values=values[:, sl], dones=dones[:, sl]
                     )
+                    if self.fail_tracker is not None:
+                        self.fail_tracker.update(map_id, rewards=rewards[:, sl], dones=dones[:, sl])
                 map_ids.append(map_id)
                 scores.append(score)
             elif log:
@@ -447,8 +470,10 @@ class Drive(pufferlib.PufferEnv):
             self._plr_dones.clear()
         if self._plr_successes is not None:
             self._plr_successes.clear()
+        if self._plr_unsafe is not None:
+            self._plr_unsafe.clear()
         if map_ids and not rollout_ready and not learn_ready:
-            self.level_sampler.update_batch(map_ids, scores)
+            self.level_sampler.update(map_ids, scores)
             scores = [float(self.level_sampler.scores[map_id]) for map_id in map_ids]
         return {"map_ids": map_ids, "scores": scores}
 
@@ -458,12 +483,18 @@ class Drive(pufferlib.PufferEnv):
         self._pending_values = np.asarray(values, dtype=np.float32).reshape(-1)
 
     def _record_plr_step(self):
-        if self.level_sampler is None or self.map_score not in ("max_mc", "pvl", "learnability"):
+        if self.level_sampler is None or self.map_score not in (
+            "max_mc",
+            "learnability",
+            "learnability_hard",
+        ):
             return
         dones = np.logical_or(self.terminals, self.truncations)
-        if self.map_score == "learnability":
-            self._plr_successes.append((np.asarray(self.rewards) > 0).astype(np.float32).copy())
+        if self.map_score in ("learnability", "learnability_hard"):
+            rewards = np.asarray(self.rewards)
+            self._plr_successes.append((rewards > 0).astype(np.float32).copy())
             self._plr_dones.append(dones.copy())
+            self._plr_unsafe.append((rewards < 0).astype(np.float32).copy())
             return
         if self._plr_value_buf is not None:
             values = np.asarray(self._plr_value_buf, dtype=np.float32).reshape(-1)
@@ -486,7 +517,7 @@ class Drive(pufferlib.PufferEnv):
         self.tick = 0
         binding.vec_close(self.c_envs)
         resample_seed = self.seed + self._resample_count
-        map_id_queue, _ = self._build_map_id_queue(self.num_agents)
+        map_id_queue = self._build_map_id_queue(self.num_agents)
         agent_offsets, map_ids, num_envs = binding.shared(
             seed=resample_seed,
             map_id_queue=map_id_queue,
@@ -596,11 +627,18 @@ class Drive(pufferlib.PufferEnv):
         sampler = getattr(self, "level_sampler", None)
         if sampler is None or not sampler.seen.any():
             return None
-        return {
+        snapshot = {
             "_plr_worker": int(os.getpid()),
             "_plr_scores": np.asarray(sampler.scores, dtype=np.float64).copy(),
             "_plr_seen": np.asarray(sampler.seen, dtype=bool).copy(),
         }
+        tracker = getattr(self, "fail_tracker", None)
+        if tracker is not None:
+            snapshot["_plr_fail_ema"] = np.asarray(tracker.fail_ema, dtype=np.float32).copy()
+            snapshot["_plr_coll_ema"] = np.asarray(tracker.coll_ema, dtype=np.float32).copy()
+            snapshot["_plr_hit_ema"] = np.asarray(tracker.hit_ema, dtype=np.float32).copy()
+            snapshot["_plr_outcome_n"] = np.asarray(tracker.outcome_n, dtype=np.float32).copy()
+        return snapshot
 
     def get_global_agent_state(self):
         """Get current global state of all active agents.

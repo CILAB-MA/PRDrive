@@ -19,9 +19,9 @@ CATEGORY_STYLE = {
         "color": "#ff7f0e",
         "label": "localized failure\nexactly 1 complete-fail car",
     },
-    "globally_difficult": {
+    "globally_suboptimal": {
         "color": "#17becf",
-        "label": "globally difficult\n2+ complete-fail cars",
+        "label": "globally suboptimal\n2+ complete-fail cars",
     },
     "many_fail": {
         "color": "#d62728",
