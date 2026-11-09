@@ -93,6 +93,7 @@ class Drive(pufferlib.PufferEnv):
         map_score="return",  # "return", "max_mc", "learnability", or "learnability_hard"
         plr_temperature=None,  # rank β; None uses the CL4AD preset for map_score
         plr_staleness_coef=None,  # staleness ρ; None uses the CL4AD preset for map_score
+        score_aggregate="mean",  # MaxMC per-vehicle collapse: mean, top, or cvar
         eval_map_log_path=None,  # eval only: save per-map logs (see _dump_map_logs)
         map_id_queue=None,  # optional explicit map ids for eval; C still stops at the agent budget
     ):
@@ -131,6 +132,7 @@ class Drive(pufferlib.PufferEnv):
                 staleness_coef=self.plr_staleness_coef,
                 max_controlled_agents=max_controlled_agents,
                 invert_scores=map_score in ("return", "episode_return"),
+                score_aggregate=score_aggregate,
             )
             self.fail_tracker = FailTracker(num_maps, max_controlled_agents)
         else:

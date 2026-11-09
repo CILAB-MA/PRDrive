@@ -164,12 +164,22 @@ class LevelSampler:
             stored = np.asarray(agent_scores, dtype=np.float64).reshape(-1)[:n_store]
             if stored.size == 0:
                 reduced = 0.0
-            elif self.score_aggregate == "max":
-                reduced = float(stored.max())
-            elif self.score_aggregate == "min":
-                reduced = float(stored.min())
+            elif self.score_aggregate == "top":
+                if self.invert_scores:
+                    reduced = float(stored.min())
+                else:
+                    reduced = float(stored.max())
             elif self.score_aggregate == "mean":
                 reduced = float(stored.mean())
+            elif self.score_aggregate == "cvar":
+                alpha = 0.1
+                k = max(1, int(np.ceil(alpha * stored.size)))
+                ordered = np.sort(stored)
+                if self.invert_scores:
+                    reduced = float(ordered[-k:].mean())
+                else:
+                    reduced = float(ordered[:k].mean())
+
             self.update(map_id, reduced)
             return float(self.scores[map_id])
         elif name == "learnability":

@@ -49,6 +49,7 @@ SEEDS=(11 3 42)
 TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-2000000000}"
 NUM_MAPS="${NUM_MAPS:-10000}"
 MAP_SCORE="${MAP_SCORE:-max_mc}"
+SCORE_AGGREGATE="${SCORE_AGGREGATE:-mean}"
 case "${MAP_SCORE}" in
   max_mc)
     SCORE_GROUP="maxmc"
@@ -103,7 +104,7 @@ echo "  GPU=${GPU_ID}"
 echo "  exp=${EXP_NAME}"
 echo "  data_dir=${DATA_DIR}"
 echo "  map_dir=${MAP_DIR}"
-echo "  strategy=prioritized score=${MAP_SCORE} β=${PLR_TEMPERATURE} ρ=${PLR_STALENESS}"
+echo "  strategy=prioritized score=${MAP_SCORE} aggregate=${SCORE_AGGREGATE} β=${PLR_TEMPERATURE} ρ=${PLR_STALENESS}"
 echo "  seeds=${SEEDS[*]}"
 echo "  total_timesteps=${TOTAL_TIMESTEPS}"
 echo "  num_maps=${NUM_MAPS}"
@@ -117,6 +118,7 @@ for SEED in "${SEEDS[@]}"; do
   CUDA_VISIBLE_DEVICES="${GPU_ID}" puffer train puffer_drive \
     --env.map-sampling-strategy prioritized \
     --env.map-score "${MAP_SCORE}" \
+    --env.score-aggregate "${SCORE_AGGREGATE}" \
     --env.plr-temperature "${PLR_TEMPERATURE}" \
     --env.plr-staleness-coef "${PLR_STALENESS}" \
     --env.map-dir "${MAP_DIR}" \

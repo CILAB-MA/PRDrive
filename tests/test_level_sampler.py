@@ -139,14 +139,27 @@ def test_max_mc_uses_best_return_minus_value():
     rewards = np.array([[1.0, 0.0], [1.0, 0.0]])
     values = np.array([[0.0, 1.0], [0.0, 1.0]])
     dones = np.array([[0.0, 0.0], [1.0, 1.0]])
-    expected = {"mean": 0.5, "max": 2.0, "min": -1.0}
-    for aggregate, want in expected.items():
-        two = LevelSampler(
-            num_maps=1, strategy="sequential", score_aggregate=aggregate, alpha=1.0, gae_gamma=1.0
-        )
-        stored = two.score(0, "max_mc", rewards=rewards, values=values, dones=dones)
-        assert stored == want
-        assert np.allclose(two.max_returns[0, :2], [2.0, 0.0])
+    two = LevelSampler(
+        num_maps=1, strategy="sequential", score_aggregate="mean", alpha=1.0, gae_gamma=1.0
+    )
+    stored = two.score(0, "max_mc", rewards=rewards, values=values, dones=dones)
+    assert stored == 0.5
+    assert np.allclose(two.max_returns[0, :2], [2.0, 0.0])
+    top = LevelSampler(
+        num_maps=1, strategy="sequential", score_aggregate="top", alpha=1.0, gae_gamma=1.0
+    )
+    stored = top.score(0, "max_mc", rewards=rewards, values=values, dones=dones)
+    assert stored == 2.0
+    low = LevelSampler(
+        num_maps=1,
+        strategy="sequential",
+        score_aggregate="top",
+        invert_scores=True,
+        alpha=1.0,
+        gae_gamma=1.0,
+    )
+    stored = low.score(0, "max_mc", rewards=rewards, values=values, dones=dones)
+    assert stored == -1.0
 
 
 def test_max_mc_keeps_per_vehicle_max_return_across_visits():

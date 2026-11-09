@@ -544,16 +544,27 @@ class PerScenarioEvaluator:
 
         grouped = defaultdict(list)
         for row in logs:
-            grouped[(row.get("mode", ""), int(row["map_id"]))].append(row)
+            grouped[
+                (
+                    row.get("mode", ""),
+                    int(row["map_id"]),
+                    row.get("checkpoint", ""),
+                    row.get("run_id", ""),
+                    row.get("epoch", ""),
+                )
+            ].append(row)
 
         out = []
-        for (mode, map_id), rows in grouped.items():
+        for (mode, map_id, checkpoint, run_id, epoch), rows in grouped.items():
             n_sum = float(sum(float(r.get("n", 0.0) or 0.0) for r in rows))
             n_mean = n_sum / len(rows) if rows else 0.0
             scenario_id = next((str(r.get("scenario_id", "")) for r in rows if r.get("scenario_id")), "")
             agg = {
                 "mode": mode,
                 "map_id": map_id,
+                "checkpoint": checkpoint,
+                "run_id": run_id,
+                "epoch": epoch,
                 "scenario_id": scenario_id,
                 "n": n_mean,
             }
