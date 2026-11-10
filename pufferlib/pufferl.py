@@ -293,6 +293,9 @@ class PuffeRL:
     def evaluate(self):
         profile = self.profile
         epoch = self.epoch
+        self.vecenv.train_epoch = int(epoch)
+        total_epochs = int(self.total_epochs) if self.total_epochs else 1
+        self.vecenv.train_total_epochs = total_epochs
         profile("eval", epoch)
         profile("eval_misc", epoch, nest=True)
 

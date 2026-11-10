@@ -84,6 +84,8 @@ class Serial:
                 masks=self.masks[ptr:end],
                 actions=self.actions[ptr:end],
             )
+            if buf is not None and "train_progress" in buf:
+                buf_i["train_progress"] = buf["train_progress"]
             ptr = end
             seed_i = seed + i if seed is not None else None
             env = env_creators[i](*env_args[i], buf=buf_i, seed=seed_i, **env_kwargs[i])
@@ -213,6 +215,7 @@ def _worker_process(
         masks=np.ndarray(shape, dtype=bool, buffer=shm["masks"])[worker_idx],
         actions=atn_arr,
         values=np.ndarray(shape, dtype=np.float32, buffer=shm["values"])[worker_idx],
+        train_progress=np.ndarray(2, dtype=np.int64, buffer=shm["train_progress"]),
     )
     buf["masks"][:] = True
 
@@ -354,6 +357,8 @@ class Multiprocessing:
             values=RawArray("f", num_agents),
             semaphores=RawArray("c", num_workers),
             notify=RawArray("b", num_workers),
+            # [epoch, total_epochs] written by the trainer before STEP.
+            train_progress=RawArray("q", 2),
         )
         shape = (num_workers, agents_per_worker)
         self.obs_batch_shape = (self.agents_per_batch, *obs_shape)
@@ -368,9 +373,12 @@ class Multiprocessing:
             values=np.ndarray(shape, dtype=np.float32, buffer=self.shm["values"]),
             semaphores=np.ndarray(num_workers, dtype=np.uint8, buffer=self.shm["semaphores"]),
             notify=np.ndarray(num_workers, dtype=bool, buffer=self.shm["notify"]),
+            train_progress=np.ndarray(2, dtype=np.int64, buffer=self.shm["train_progress"]),
         )
         self.buf["values"].fill(np.nan)
         self.buf["semaphores"][:] = MAIN
+        self.buf["train_progress"][0] = 0
+        self.buf["train_progress"][1] = 1
 
         from multiprocessing import Pipe, Process
 
@@ -510,6 +518,12 @@ class Multiprocessing:
 
         idxs = self.w_slice
         self.actions[idxs] = actions
+        epoch = getattr(self, "train_epoch", None)
+        if epoch is not None:
+            slot = self.buf["train_progress"]
+            slot[0] = int(epoch)
+            total = int(getattr(self, "train_total_epochs", 1) or 1)
+            slot[1] = total if total > 0 else 1
         pending = getattr(self, "pending_plr_values", None)
         if pending is not None and "values" in self.buf:
             vals = np.asarray(pending, dtype=np.float32).reshape(self.buf["values"][idxs].shape)

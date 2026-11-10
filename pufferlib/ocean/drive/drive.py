@@ -157,6 +157,7 @@ class Drive(pufferlib.PufferEnv):
                 self._plr_successes = []
                 self._plr_dones = []
                 self._plr_unsafe = []
+        self._train_progress = buf.get("train_progress") if isinstance(buf, dict) else None
         self.reward_vehicle_collision = reward_vehicle_collision
         self.reward_offroad_collision = reward_offroad_collision
         self.reward_goal = reward_goal
@@ -412,9 +413,18 @@ class Drive(pufferlib.PufferEnv):
             return None
         return self.level_sampler.sample_queue(self.controllable_counts, batch_size)
 
+    def recv_train_progress(self):
+        """Read the trainer epoch from the shared step buffer."""
+        slot = self._train_progress
+        if slot is None or self.level_sampler is None:
+            return
+        total = int(slot[1])
+        self.level_sampler.set_progress(int(slot[0]), total if total > 0 else 1)
+
     def _report_map_scores_to_sampler(self):
         if self.level_sampler is None:
             return {}
+        self.recv_train_progress()
         logs = self.get_env_logs()
         map_ids = []
         scores = []

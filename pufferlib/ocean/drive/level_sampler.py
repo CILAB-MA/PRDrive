@@ -39,6 +39,8 @@ class LevelSampler:
         self.gae_gamma = float(gae_gamma)
         self.max_controlled_agents = int(max_controlled_agents)
         self.invert_scores = bool(invert_scores)
+        self.epoch = 0
+        self.total_epochs = 1
         self._rng = np.random.default_rng(seed)
 
         self.scores = np.zeros(self.num_maps, dtype=np.float64)
@@ -49,6 +51,12 @@ class LevelSampler:
         self.max_returns = np.zeros((self.num_maps, self.max_controlled_agents), dtype=np.float64)
         self.max_return_valid = np.zeros((self.num_maps, self.max_controlled_agents), dtype=bool)
         self._next_index = 0
+
+    def set_progress(self, epoch, total_epochs):
+        """Training update index and planned update count, for the beta schedule."""
+        self.epoch = int(epoch)
+        total = int(total_epochs)
+        self.total_epochs = total if total > 0 else 1
 
     # ---- weighting -------------------------------------------------
 
@@ -180,6 +188,11 @@ class LevelSampler:
                     reduced = float(ordered[:k].mean())
                 else:
                     reduced = float(ordered[-k:].mean())
+            elif self.score_aggregate == "lse_beta":
+                beta = beta_scheduler(self.epoch, self.total_epochs)
+                reduced = aggregate_lse_beta(stored, beta)
+            else:
+                raise ValueError(f"Unknown score aggregate: {self.score_aggregate!r}")
 
             self.update(map_id, reduced)
             return float(self.scores[map_id])
@@ -191,6 +204,25 @@ class LevelSampler:
             return float(self.scores[map_id])
         raise ValueError(f"Unknown score function: {score_function!r}")
 
+def aggregate_lse_beta(scores, beta):
+    scores = np.asarray(scores, dtype=np.float64)
+    if scores.size == 0:
+        return 0.0
+    if abs(beta) < 1e-8:
+        return float(scores.mean())
+    x = beta * scores
+    x_max = np.max(x)
+    return float((x_max + np.log(np.exp(x - x_max).mean())) / beta)
+
+def beta_scheduler(epoch, total_epochs, initial_beta=0.0, final_beta=10.0, scheduling="linear"):
+    if scheduling == "linear":
+        return initial_beta + (final_beta - initial_beta) * (epoch / total_epochs)
+    elif scheduling == "cosine":
+        return initial_beta + (final_beta - initial_beta) * (1.0 - np.cos(np.pi * epoch / total_epochs)) / 2.0
+    elif scheduling == "exponential":
+        return initial_beta + (final_beta - initial_beta) * np.exp(-epoch / total_epochs)
+    else:
+        raise ValueError(f"Unknown scheduling: {scheduling!r}")
 
 def _split_sampler_state(state):
     if isinstance(state, dict):

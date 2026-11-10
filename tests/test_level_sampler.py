@@ -186,6 +186,40 @@ def test_max_mc_uses_best_return_minus_value():
     assert stored == -1.0
 
 
+def test_lse_beta_uses_training_epoch():
+    rewards = np.array([[2.0], [2.0]])
+    values = np.zeros((2, 1))
+    dones = np.array([[0.0], [1.0]])
+    ls = LevelSampler(
+        num_maps=1, strategy="sequential", score_aggregate="lse_beta", alpha=1.0, gae_gamma=1.0
+    )
+    ls.set_progress(epoch=0, total_epochs=0)
+    assert ls.total_epochs == 1
+    # Full schedule: linear default goes 0 → 10, so the last update uses beta 10.
+    ls.set_progress(epoch=10, total_epochs=10)
+    stored = ls.score(0, "max_mc", rewards=rewards, values=values, dones=dones)
+    # One vehicle, MaxMC 4. Log-sum-exp of a single score is the score.
+    assert np.isclose(stored, 4.0)
+
+
+def test_lse_beta_handles_nonpositive_scores():
+    from pufferlib.ocean.drive.level_sampler import aggregate_lse_beta
+    import warnings
+
+    scores = np.array([0.0, 4.0, -1.0])
+    beta = 10.0
+    x = beta * scores
+    x_max = np.max(x)
+    expected = (x_max + np.log(np.exp(x - x_max).mean())) / beta
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        out = aggregate_lse_beta(scores, beta=beta)
+        near_zero = aggregate_lse_beta(scores, beta=0.0)
+    assert np.isfinite(out)
+    assert np.isclose(out, expected)
+    assert np.isclose(near_zero, scores.mean())
+
+
 def test_max_mc_keeps_per_vehicle_max_return_across_visits():
     ls = LevelSampler(
         num_maps=2, strategy="sequential", score_aggregate="mean", alpha=1.0, gae_gamma=1.0
